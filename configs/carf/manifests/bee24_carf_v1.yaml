@@ -1,0 +1,51 @@
+schema_version: carf.split.v1
+deprecated: true
+deprecation_note: Replaced by bee24_carf_v2.yaml for the first real experiment.
+dataset: BEE24
+source:
+  videos: 36
+  official_test_source: TOPICTrack/results/gt/seqmaps/BEE24-val.txt
+  note: Official train is BEE2401-BEE2436 excluding the five official test sequences.
+split_rule:
+  unit: sequence
+  seed_text: carf-v1-bee24
+  method: six lowest SHA256(seed_text + ':' + sequence) assigned to development
+project_train:
+  - BEE2401
+  - BEE2402
+  - BEE2403
+  - BEE2404
+  - BEE2405
+  - BEE2407
+  - BEE2409
+  - BEE2410
+  - BEE2411
+  - BEE2415
+  - BEE2417
+  - BEE2419
+  - BEE2422
+  - BEE2423
+  - BEE2425
+  - BEE2426
+  - BEE2427
+  - BEE2429
+  - BEE2430
+  - BEE2431
+  - BEE2432
+  - BEE2433
+  - BEE2434
+  - BEE2435
+  - BEE2436
+development:
+  - BEE2406
+  - BEE2408
+  - BEE2414
+  - BEE2421
+  - BEE2424
+  - BEE2428
+official_test:
+  - BEE2412
+  - BEE2413
+  - BEE2416
+  - BEE2418
+  - BEE2420

@@ -1,0 +1,4 @@
+numpy
+scipy
+lap
+PyYAML

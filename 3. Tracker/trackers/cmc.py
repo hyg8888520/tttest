@@ -1,22 +1,30 @@
 import pickle
+import os
 import numpy as np
 
 
 class CMC:
-    def __init__(self, vid_name):
+    def __init__(self, vid_name, cmc_dir='./trackers/cmc', identity=False):
         super(CMC, self).__init__()
+
+        self.identity = bool(identity)
+        self.gmcFile = None
+        if self.identity:
+            return
 
         if 'MOT17' in vid_name:
             vid_name = vid_name.split('-FRCNN')[0]
         elif 'dance' in vid_name:
             vid_name = 'dancetrack-' + vid_name.split('dancetrack')[1]
 
-        self.gmcFile = open('./trackers/cmc/' + 'GMC-' + vid_name + ".txt", 'r')
+        self.gmcFile = open(os.path.join(cmc_dir, 'GMC-' + vid_name + '.txt'), 'r')
 
     def get_warp_matrix(self):
+        if self.identity:
+            return np.eye(2, 3, dtype=float)
         line = self.gmcFile.readline()
         tokens = line.split("\t")
-        warp_matrix = np.eye(2, 3, dtype=np.float_)
+        warp_matrix = np.eye(2, 3, dtype=float)
         warp_matrix[0, 0] = float(tokens[1])
         warp_matrix[0, 1] = float(tokens[2])
         warp_matrix[0, 2] = float(tokens[3])
