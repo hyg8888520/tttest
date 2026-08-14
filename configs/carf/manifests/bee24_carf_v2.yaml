@@ -5,16 +5,16 @@ source:
   official_test_source: TOPICTrack/results/gt/seqmaps/BEE24-val.txt
   note: Sequence IDs use the exact TOPIC cache spelling without hyphens.
 
-# Minimal real-data Gate 0 only.
+# Minimal real-data Gate 0 only. BEE2414 is deliberately excluded: its raw
+# training GT contains conflicting boxes with the same (frame, identity), so it
+# is not valid MOTChallenge/TrackEval input. Gate 0 never rewrites GT identities.
 gate0:
   - BEE2406
-  - BEE2414
 
 # Chosen development mechanisms; this is not described as a 20% validation split.
 development_core:
   - BEE2406
   - BEE2410
-  - BEE2414
   - BEE2415
   - BEE2426
   - BEE2429
@@ -26,11 +26,16 @@ development_long:
 oracle_development:
   - BEE2406
   - BEE2410
-  - BEE2414
   - BEE2415
   - BEE2426
   - BEE2429
   - BEE2435
+
+# Raw annotation is not a valid MOT evaluation target: frame 60 contains two
+# distinct boxes labelled identity 68. Keep this explicit; never repair it by
+# deleting a box or inventing a new identity.
+excluded_non_trackeval:
+  - BEE2414
 
 stress_dense_long:
   - BEE2433
