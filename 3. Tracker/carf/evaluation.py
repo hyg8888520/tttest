@@ -11,6 +11,61 @@ import trackeval
 METRIC_NAMES = ('HOTA', 'DetA', 'AssA', 'IDF1', 'IDSW', 'MOTA', 'Frag')
 
 
+def _gt_path(gt_root, sequence):
+    candidates = [
+        os.path.join(gt_root, sequence, 'gt', 'gt.txt'),
+        os.path.join(gt_root, 'BEE24-val', sequence, 'gt', 'gt.txt'),
+        os.path.join(gt_root, 'train', sequence, 'gt', 'gt.txt'),
+    ]
+    path = next((item for item in candidates if os.path.isfile(item)), None)
+    if path is None:
+        raise FileNotFoundError('gt.txt not found for %s' % sequence)
+    return path
+
+
+def trackeval_gt_conflicts(gt_root, sequences):
+    """Return all duplicate per-frame GT identities without changing GT."""
+    conflicts = {}
+    for sequence in sequences:
+        first_lines = {}
+        sequence_conflicts = []
+        with open(_gt_path(gt_root, sequence), 'r', encoding='utf-8-sig') as handle:
+            for line_number, line in enumerate(handle, 1):
+                fields = [field.strip() for field in line.split(',')]
+                if len(fields) < 2:
+                    continue
+                key = (int(float(fields[0])), int(float(fields[1])))
+                if key in first_lines:
+                    sequence_conflicts.append({
+                        'frame_id': key[0],
+                        'gt_id': key[1],
+                        'first_line': first_lines[key],
+                        'duplicate_line': line_number,
+                    })
+                else:
+                    first_lines[key] = line_number
+        if sequence_conflicts:
+            conflicts[sequence] = sequence_conflicts
+    return conflicts
+
+
+def require_trackeval_compatible_gt(gt_root, sequences):
+    """Fail before tracking if a configured sequence cannot be evaluated."""
+    conflicts = trackeval_gt_conflicts(gt_root, sequences)
+    if not conflicts:
+        return
+    summaries = []
+    for sequence, items in sorted(conflicts.items()):
+        first = items[0]
+        summaries.append(
+            '%s: conflicts=%d, first=frame:%d id:%d lines:%d,%d' % (
+                sequence, len(items), first['frame_id'], first['gt_id'],
+                first['first_line'], first['duplicate_line']))
+    raise ValueError(
+        'GT is not TrackEval-compatible; raw GT was not modified:\n' +
+        '\n'.join(summaries))
+
+
 def _sequence_lengths(gt_root, sequences):
     result = {}
     for sequence in sequences:

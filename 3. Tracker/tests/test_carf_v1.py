@@ -17,7 +17,9 @@ from carf.auditor import CARFAuditor
 from carf.policies import (authority_for_policy,
                            counterfactual_auditing_active)
 from carf.inputs import load_topic_cache, sanity_check_inputs
-from carf.evaluation import metrics_delta_vs_baseline
+from carf.evaluation import (metrics_delta_vs_baseline,
+                             require_trackeval_compatible_gt,
+                             trackeval_gt_conflicts)
 from carf.oracle import OnlineGTAnchorOracle, match_detections_to_gt
 from trackeval.datasets import MotChallenge2DBox
 from trackers.track import Track, TrackCounter
@@ -504,6 +506,30 @@ class TestV2Diagnostics(unittest.TestCase):
 
 
 class TestVendoredTrackEval(unittest.TestCase):
+    def test_gt_preflight_reports_all_conflicting_sequences(self):
+        with tempfile.TemporaryDirectory() as root:
+            for sequence, rows in {
+                    'VALID': [[1, 1, 0, 0, 10, 10, 1, 1, 1]],
+                    'BAD_A': [
+                        [1, 7, 0, 0, 10, 10, 1, 1, 1],
+                        [1, 7, 20, 0, 10, 10, 1, 1, 1],
+                    ],
+                    'BAD_B': [
+                        [2, 8, 0, 0, 10, 10, 1, 1, 1],
+                        [2, 8, 20, 0, 10, 10, 1, 1, 1],
+                    ],
+            }.items():
+                gt_dir = os.path.join(root, sequence, 'gt')
+                os.makedirs(gt_dir)
+                np.savetxt(os.path.join(gt_dir, 'gt.txt'), rows, delimiter=',')
+
+            sequences = ['VALID', 'BAD_A', 'BAD_B']
+            conflicts = trackeval_gt_conflicts(root, sequences)
+            self.assertEqual(set(conflicts), {'BAD_A', 'BAD_B'})
+            with self.assertRaisesRegex(
+                    ValueError, r'BAD_A: conflicts=1[\s\S]*BAD_B: conflicts=1'):
+                require_trackeval_compatible_gt(root, sequences)
+
     def test_non_zip_tracker_subfolder_is_used_for_check_and_load(self):
         with tempfile.TemporaryDirectory() as root:
             sequence = 'BEE2406'

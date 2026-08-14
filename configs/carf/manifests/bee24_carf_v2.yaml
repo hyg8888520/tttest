@@ -15,30 +15,29 @@ gate0:
 development_core:
   - BEE2406
   - BEE2410
-  - BEE2415
   - BEE2426
   - BEE2429
 
-development_long:
-  - BEE2435
+development_long: []
 
 # Convenience union for the online Oracle experiment.
 oracle_development:
   - BEE2406
   - BEE2410
-  - BEE2415
   - BEE2426
   - BEE2429
-  - BEE2435
 
-# Raw annotation is not a valid MOT evaluation target: frame 60 contains two
-# distinct boxes labelled identity 68. Keep this explicit; never repair it by
-# deleting a box or inventing a new identity.
+# Raw annotations are not valid MOT evaluation targets because distinct boxes
+# share a (frame, identity) pair. Counts from the frozen full-train preflight:
+# BEE2414=1, BEE2415=1, BEE2433=959, BEE2435=36. Never repair these by deleting
+# a box or inventing a new identity.
 excluded_non_trackeval:
   - BEE2414
-
-stress_dense_long:
+  - BEE2415
   - BEE2433
+  - BEE2435
+
+stress_dense_long: []
 
 # Remaining official-train sequences, excluding the development/stress groups.
 project_train:

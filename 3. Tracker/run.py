@@ -6,7 +6,8 @@ import time
 from utils.etc import *
 from trackers.tracker import Tracker
 from carf.config import load_config, load_manifest, require_resolved
-from carf.evaluation import evaluate_results, metrics_delta_vs_baseline
+from carf.evaluation import (evaluate_results, metrics_delta_vs_baseline,
+                             require_trackeval_compatible_gt)
 from carf.inputs import load_inputs, sanity_check_inputs
 from carf.logging import AuditJSONLWriter
 from carf.oracle import OnlineGTAnchorOracle
@@ -130,6 +131,12 @@ def run_configured(config_path, overrides):
     require_resolved(config['inputs']['reid_features'], 'inputs.reid_features')
     output_root = os.path.abspath(require_resolved(
         config['output']['root'], 'output.root'))
+    evaluation = config.get('evaluation', {})
+    if (evaluation.get('enabled', False) or
+            (args.carf_enabled and args.carf_policy == 'oracle_gt')):
+        require_trackeval_compatible_gt(
+            require_resolved(config['dataset']['gt_root'], 'dataset.gt_root'),
+            sequences)
     detections, detections_95 = load_inputs(config, sequences=sequences)
 
     if args.sanity_only:
@@ -218,7 +225,6 @@ def run_configured(config_path, overrides):
                   encoding='utf-8') as handle:
             json.dump(diagnostic_payload, handle, indent=2, sort_keys=True)
 
-    evaluation = config.get('evaluation', {})
     if evaluation.get('enabled', False):
         metrics = evaluate_results(
             require_resolved(config['dataset']['gt_root'], 'dataset.gt_root'),

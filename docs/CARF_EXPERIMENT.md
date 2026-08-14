@@ -69,10 +69,11 @@ cache keys, for example `BEE2406`, not `BEE24-06`.
 - Gate 0: `BEE2406`. `BEE2414` is excluded because its raw training GT has
   conflicting boxes sharing one `(frame, identity)` pair and therefore is not
   valid TrackEval input. CARF does not rewrite or guess GT identities.
-- `development_core`: 06, 10, 15, 26, 29.
-- `development_long`: 35 (5000-frame moderate-density horizon).
-- `stress_dense_long`: 33, frozen for later stress evaluation.
-- `excluded_non_trackeval`: 14, whose raw GT violates per-frame ID uniqueness.
+- `development_core`: 06, 10, 26, 29.
+- `development_long` and `stress_dense_long` are empty in V2 because their
+  former sequences do not satisfy TrackEval's per-frame ID uniqueness rule.
+- `excluded_non_trackeval`: 14, 15, 33, 35. Their conflicting `(frame, ID)`
+  counts are respectively 1, 1, 959, and 36. The raw GT is never rewritten.
 - Official test: 12, 13, 16, 18, 20, frozen and never used for tuning.
 
 The old hash-based v1 manifest is retained but marked deprecated.
