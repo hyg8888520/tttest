@@ -207,6 +207,30 @@ class TestEquivalence(unittest.TestCase):
 
 
 class TestBEE24Adapter(unittest.TestCase):
+    def test_sanity_reports_out_of_bounds_without_mutating_detections(self):
+        with tempfile.TemporaryDirectory() as root:
+            sequence = 'BEE2414'
+            seq_dir = os.path.join(root, 'train', sequence)
+            os.makedirs(seq_dir)
+            with open(os.path.join(seq_dir, 'seqinfo.ini'), 'w') as handle:
+                handle.write(
+                    '[Sequence]\nimHeight=600\nimWidth=950\nseqLength=1\n')
+            rows = np.asarray([
+                [-3.0, 570.0, 35.0, 607.0, .9, 1.0, 1.0, 0.0]
+            ])
+            before = rows.copy()
+            detections = {sequence: {1: rows}}
+            sanity = sanity_check_inputs(
+                detections, detections, root, [sequence], det_thr=.6)
+            values = sanity['sequences'][sequence]
+            self.assertEqual(sanity['status'], 'PASS')
+            self.assertEqual(values['out_of_bounds_detections'], 1)
+            self.assertEqual(values['clipped_detections'], 0)
+            self.assertEqual(values['dropped_degenerate_detections'], 0)
+            self.assertEqual(values['max_boundary_overflow']['left'], 3.0)
+            self.assertEqual(values['max_boundary_overflow']['bottom'], 7.0)
+            np.testing.assert_array_equal(rows, before)
+
     def test_topic_cache_adapter_preserves_row_order_and_scale(self):
         with tempfile.TemporaryDirectory() as root:
             sequence = 'BEE2401'

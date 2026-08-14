@@ -126,6 +126,13 @@ The local official TOPIC implementation stores:
 - the official five-sequence test list in
   `TOPICTrack/results/gt/seqmaps/BEE24-val.txt`.
 
+The detector cache contains raw YOLOX coordinates. TOPIC's
+`OCSort.extract_detections` divides these boxes by the image resize scale and
+does not clip the boxes used for association. `EmbeddingComputer` clips only a
+local integer copy used to crop ReID patches. The CARF adapter therefore reports
+out-of-image detector geometry but never clips the observations supplied to
+TrackTrack.
+
 The adapter reproduces TOPIC's published area filter `(432, 10710)`, score
 floor `0.4`, high/second split `0.6`, and input resize scale before emitting the
 TrackTrack array layout. It reads caches only. TOPIC publishes one NMS stream,

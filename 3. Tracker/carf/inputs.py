@@ -156,10 +156,11 @@ def select_sequences(detections, sequence_names):
 
 def sanity_check_inputs(detections, detections_95, dataset_root,
                         sequences, det_thr=0.6):
-    """Fail loudly on cache alignment, shape, scale, and frame-key errors."""
+    """Validate cache structure and report detector geometry non-destructively."""
     report = {
-        'schema_version': 'carf.data_sanity.v1',
+        'schema_version': 'carf.data_sanity.v2',
         'alignment_checked_during_load': True,
+        'bbox_bounds_policy': 'report_only_preserve_detector_geometry',
         'sequences': {},
     }
     for sequence in sequences:
@@ -186,10 +187,15 @@ def sanity_check_inputs(detections, detections_95, dataset_root,
             'high_detections': 0,
             'low_detections': 0,
             'companion_detections': 0,
+            'out_of_bounds_detections': 0,
+            'clipped_detections': 0,
+            'dropped_degenerate_detections': 0,
         }
         feature_dims = set()
-        tolerance_x = max(2.0, image_w * 0.05)
-        tolerance_y = max(2.0, image_h * 0.05)
+        coordinate_min = np.full(4, np.inf, dtype=np.float64)
+        coordinate_max = np.full(4, -np.inf, dtype=np.float64)
+        max_overflow = {'left': 0.0, 'top': 0.0,
+                        'right': 0.0, 'bottom': 0.0}
         for frame_id in range(1, sequence_length + 1):
             rows = detections[sequence][frame_id]
             companion = detections_95[sequence][frame_id]
@@ -211,13 +217,23 @@ def sanity_check_inputs(detections, detections_95, dataset_root,
                     boxes[:, 3] <= boxes[:, 1]):
                 raise ValueError('%s:%d has non-positive boxes' %
                                  (sequence, frame_id))
-            if (np.min(boxes[:, [0, 2]]) < -tolerance_x or
-                    np.max(boxes[:, [0, 2]]) > image_w + tolerance_x or
-                    np.min(boxes[:, [1, 3]]) < -tolerance_y or
-                    np.max(boxes[:, [1, 3]]) > image_h + tolerance_y):
-                raise ValueError(
-                    '%s:%d box range is inconsistent with %dx%d images' %
-                    (sequence, frame_id, image_w, image_h))
+            out_of_bounds = (
+                (boxes[:, 0] < 0) | (boxes[:, 1] < 0) |
+                (boxes[:, 2] > image_w) | (boxes[:, 3] > image_h))
+            counts['out_of_bounds_detections'] += int(
+                np.sum(out_of_bounds))
+            coordinate_min = np.minimum(coordinate_min, np.min(boxes, axis=0))
+            coordinate_max = np.maximum(coordinate_max, np.max(boxes, axis=0))
+            max_overflow['left'] = max(
+                max_overflow['left'], float(max(0.0, -np.min(boxes[:, 0]))))
+            max_overflow['top'] = max(
+                max_overflow['top'], float(max(0.0, -np.min(boxes[:, 1]))))
+            max_overflow['right'] = max(
+                max_overflow['right'],
+                float(max(0.0, np.max(boxes[:, 2]) - image_w)))
+            max_overflow['bottom'] = max(
+                max_overflow['bottom'],
+                float(max(0.0, np.max(boxes[:, 3]) - image_h)))
             counts['nonempty_frames'] += 1
             counts['detections'] += len(rows)
             counts['embedding_rows'] += len(rows)
@@ -232,6 +248,14 @@ def sanity_check_inputs(detections, detections_95, dataset_root,
             'image_width': image_w,
             'embedding_dim': (
                 next(iter(feature_dims)) if feature_dims else None),
+            'out_of_bounds_ratio': (
+                counts['out_of_bounds_detections'] / counts['detections']
+                if counts['detections'] else None),
+            'bbox_coordinate_min_xyxy': (
+                coordinate_min.tolist() if counts['detections'] else None),
+            'bbox_coordinate_max_xyxy': (
+                coordinate_max.tolist() if counts['detections'] else None),
+            'max_boundary_overflow': max_overflow,
         })
         report['sequences'][sequence] = counts
     report['status'] = 'PASS'

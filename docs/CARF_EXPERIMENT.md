@@ -96,8 +96,17 @@ Identity CMC is frozen for BEE24 and does not read `BEE24_CMC_ROOT`.
 ## Phase 0: data sanity
 
 This validates sequence/frame keys, detection and embedding row alignment,
-finite/positive boxes, image-scale bounds, feature dimensions, and high/low
-detection counts. It never regenerates a TOPIC cache.
+finite/positive boxes, feature dimensions, and high/low detection counts. It
+also reports out-of-image detector boxes, their ratio, coordinate extrema, and
+maximum boundary overflow. It never regenerates a TOPIC cache.
+
+Out-of-image detector boxes are not clipped or dropped. TOPIC's official cache
+contains raw YOLOX geometry, and its tracker divides coordinates by the resize
+scale without clipping association boxes; only the local ReID crop copy is
+clipped. Changing association boxes here would alter IoU, Kalman updates, and
+tracking output, violating baseline preservation. Non-finite values,
+non-positive boxes, cache-key errors, and detection/embedding misalignment
+remain hard failures.
 
 ```bash
 python "3. Tracker/run.py" --sanity-only \
@@ -105,7 +114,8 @@ python "3. Tracker/run.py" --sanity-only \
   dataset.split=development_core
 ```
 
-Expected output: `$OUTPUT_ROOT/data_sanity.json`. Any mismatch fails loudly.
+Expected output: `$OUTPUT_ROOT/data_sanity.json`. Structural/format mismatches
+fail loudly; boundary overflow is recorded for diagnosis without mutation.
 
 ## Phase 1: real-data Gate 0
 
