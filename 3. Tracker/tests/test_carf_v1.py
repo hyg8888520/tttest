@@ -17,6 +17,7 @@ from carf.policies import authority_for_policy
 from carf.inputs import load_topic_cache, sanity_check_inputs
 from carf.evaluation import metrics_delta_vs_baseline
 from carf.oracle import OnlineGTAnchorOracle, match_detections_to_gt
+from trackeval.datasets import MotChallenge2DBox
 from trackers.track import Track, TrackCounter
 from trackers.tracker import Tracker
 from trackers.utils import iterative_assignment
@@ -441,6 +442,45 @@ class TestV2Diagnostics(unittest.TestCase):
         self.assertEqual(snapshot['frame_id'], 2)
         self.assertEqual(5 - snapshot['frame_id'], 3)
         self.assertEqual(track.num_feature_writes, 2)
+
+
+class TestVendoredTrackEval(unittest.TestCase):
+    def test_non_zip_tracker_subfolder_is_used_for_check_and_load(self):
+        with tempfile.TemporaryDirectory() as root:
+            sequence = 'BEE2406'
+            gt_root = os.path.join(root, 'gt')
+            tracker_root = os.path.join(root, 'trackers')
+            gt_dir = os.path.join(gt_root, sequence, 'gt')
+            result_dir = os.path.join(tracker_root, 'baseline', 'data')
+            os.makedirs(gt_dir)
+            os.makedirs(result_dir)
+            with open(os.path.join(gt_dir, 'gt.txt'), 'w') as handle:
+                handle.write('1,1,0,0,10,10,1,1,1\n')
+            with open(os.path.join(result_dir, sequence + '.txt'), 'w') as handle:
+                handle.write('1,7,0,0,10,10,0.9,-1,-1,-1\n')
+
+            dataset = MotChallenge2DBox({
+                'GT_FOLDER': gt_root,
+                'TRACKERS_FOLDER': tracker_root,
+                'OUTPUT_FOLDER': None,
+                'TRACKERS_TO_EVAL': ['baseline'],
+                'CLASSES_TO_EVAL': ['pedestrian'],
+                'BENCHMARK': 'BEE24',
+                'SPLIT_TO_EVAL': 'val',
+                'INPUT_AS_ZIP': False,
+                'PRINT_CONFIG': False,
+                'DO_PREPROC': False,
+                'TRACKER_SUB_FOLDER': 'data',
+                'OUTPUT_SUB_FOLDER': '',
+                'TRACKER_DISPLAY_NAMES': None,
+                'SEQMAP_FOLDER': None,
+                'SEQMAP_FILE': None,
+                'SEQ_INFO': {sequence: 1},
+                'GT_LOC_FORMAT': '{gt_folder}/{seq}/gt/gt.txt',
+                'SKIP_SPLIT_FOL': True,
+            })
+            raw = dataset._load_raw_file('baseline', sequence, is_gt=False)
+            self.assertEqual(raw['tracker_ids'][0].tolist(), [7])
 
 
 if __name__ == '__main__':
