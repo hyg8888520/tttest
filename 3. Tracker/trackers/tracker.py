@@ -1,10 +1,21 @@
 from trackers.cmc import *
 from trackers.utils import *
 from trackers.track import *
+from carf.auditor import CARFAuditor
+from carf.policies import authority_for_policy
+
+
+def _feature_cosine(before, after):
+    before = np.asarray(before).reshape(-1)
+    after = np.asarray(after).reshape(-1)
+    denominator = np.linalg.norm(before) * np.linalg.norm(after)
+    if denominator == 0:
+        return None
+    return float(np.dot(before, after) / denominator)
 
 
 class Tracker(object):
-    def __init__(self, args, vid_name):
+    def __init__(self, args, vid_name, audit_logger=None, oracle=None):
         # Initialize
         self.args = args
         self.max_time_lost = args.max_time_lost
@@ -15,7 +26,113 @@ class Tracker(object):
         self.counter = TrackCounter()
 
         # Set global motion compensation model
-        self.cmc = CMC(vid_name)
+        self.cmc = CMC(
+            vid_name,
+            cmc_dir=getattr(args, 'cmc_dir', './trackers/cmc'),
+            identity=getattr(args, 'cmc_identity', False),
+        )
+
+        # CARF never supplies matches to the main tracker. It only determines
+        # authority for the appearance update after official matches exist.
+        self.sequence = vid_name
+        self.carf_policy = getattr(args, 'carf_policy', 'baseline')
+        self.carf_enabled = (bool(getattr(args, 'carf_enabled', False)) and
+                             self.carf_policy != 'baseline')
+        self.carf_soft_power = float(getattr(args, 'carf_soft_power', 1.0))
+        self.audit_logger = audit_logger
+        self.oracle = oracle
+        self.carf_auditor = None
+        if self.carf_enabled:
+            self.carf_auditor = CARFAuditor(
+                getattr(args, 'carf_rollback_writes', [1, 3]))
+
+    def _association_kwargs(self):
+        return {
+            'match_thr': self.args.match_thr,
+            'penalty_p': self.args.penalty_p,
+            'penalty_q': self.args.penalty_q,
+            'reduce_step': self.args.reduce_step,
+            'frame_id': self.frame_id,
+        }
+
+    def _update_accepted_matches(self, stage_tracks, detection_groups,
+                                 matches, stage_name):
+        flat_detections = (list(detection_groups[0]) +
+                           list(detection_groups[1]) +
+                           list(detection_groups[2]))
+
+        if not self.carf_enabled:
+            # Exact original update route when CARF is disabled.
+            for t, d in matches:
+                stage_tracks[t].update(self.frame_id, flat_detections[d])
+            return
+
+        pending = []
+        for t, d in matches:
+            track = stage_tracks[t]
+            detection = flat_detections[d]
+            rollback_states = {
+                writes: track.get_rollback_feature(writes)
+                for writes in self.carf_auditor.rollback_writes
+            }
+            audit = self.carf_auditor.audit_match(
+                baseline_tracker_state=stage_tracks,
+                frame_detections=detection_groups,
+                accepted_match=(t, d),
+                association_stage=stage_name,
+                rollback_states=rollback_states,
+                association_kwargs=self._association_kwargs(),
+            )
+
+            oracle_fields = {
+                'gt_id': None,
+                'canonical_gt_id': None,
+                'oracle_correct_write': None,
+                'oracle_unknown': True,
+                'idsw_event': None,
+                'oracle_label': None,
+            }
+            if self.oracle is not None:
+                oracle_fields = self.oracle.judge(
+                    self.frame_id, track.track_id, d, flat_detections)
+
+            authority = authority_for_policy(
+                self.carf_policy,
+                audit_result=audit,
+                soft_power=self.carf_soft_power,
+                oracle_correct_write=oracle_fields['oracle_correct_write'],
+                enabled=self.carf_enabled,
+            )
+            pending.append((t, d, audit, oracle_fields, authority,
+                            track.feat.copy(), track.num_feature_writes))
+
+        # Apply only after every counterfactual has observed the exact state
+        # on which the official stage assignment was decoded.
+        for (t, d, audit, oracle_fields, authority, feature_before,
+             num_writes) in pending:
+            track = stage_tracks[t]
+            detection = flat_detections[d]
+            track.update(self.frame_id, detection, authority=authority)
+            if self.audit_logger is None:
+                continue
+            fields = audit.as_log_fields()
+            for writes, survived in audit.rollback_survived.items():
+                fields['rollback_%d_survived' % writes] = survived
+            fields.update({
+                'sequence': self.sequence,
+                'frame_id': self.frame_id,
+                'track_id': int(track.track_id),
+                'association_stage': stage_name,
+                'detection_index': int(getattr(detection, 'frame_detection_index', d)),
+                'stage_detection_index': int(d),
+                'detection_score': float(detection.score),
+                'num_previous_feature_writes': int(num_writes),
+                'policy': self.carf_policy,
+                'authority_q': float(authority),
+                'feature_cos_before_after': _feature_cosine(feature_before, track.feat),
+                **oracle_fields,
+            })
+            self.audit_logger.write(fields)
 
     def init_tracks(self, dets):
         # Get alive tracks, iou_similarity, and scores
@@ -40,6 +157,10 @@ class Tracker(object):
         dets_del = find_deleted_detections(dets, dets_95)
         dets = [Track(self.args, d) for d in dets]
         dets_del = [Track(self.args, d) for d in dets_del]
+        for detection_index, detection in enumerate(dets):
+            detection.frame_detection_index = detection_index
+        for detection_index, detection in enumerate(dets_del, start=len(dets)):
+            detection.frame_detection_index = detection_index
 
         # Divide detections
         dets_high = [d for d in dets if d.score > self.args.det_thr]
@@ -67,8 +188,9 @@ class Tracker(object):
                                                          self.args.reduce_step, self.frame_id)
 
         # Update matched tracks
-        for t, d in matches:
-            tracked_lost[t].update(self.frame_id, dets[d])
+        self._update_accepted_matches(
+            tracked_lost, (dets_high, dets_low, dets_del_high), matches,
+            'tracked_lost')
 
         # Mark "lost" to unmatched tracks
         for t in u_tracks:
@@ -84,8 +206,8 @@ class Tracker(object):
                                                          self.args.reduce_step, self.frame_id)
 
         # Update matched tracks
-        for t, d in matches:
-            new[t].update(self.frame_id, dets_high_left[d])
+        self._update_accepted_matches(
+            new, (dets_high_left, [], []), matches, 'new')
 
         # Mark "remove" to unmatched tracks
         for t in u_tracks:

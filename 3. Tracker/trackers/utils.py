@@ -1,4 +1,7 @@
-import lap
+try:
+    import lap
+except ImportError:  # The active official iterative decoder does not use LAP.
+    lap = None
 import numpy as np
 
 
@@ -159,6 +162,8 @@ def linear_assignment(cost_matrix, thresh):
     if cost_matrix.size == 0:
         return np.empty((0, 2), dtype=int), tuple(range(cost_matrix.shape[0])), tuple(range(cost_matrix.shape[1]))
 
+    if lap is None:
+        raise ImportError('lap is required only for the inactive LAP helper')
     matches, unmatched_a, unmatched_b = [], [], []
     cost, x, y = lap.lapjv(cost_matrix, extend_cost=True, cost_limit=thresh)
     for ix, mx in enumerate(x):

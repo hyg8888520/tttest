@@ -1,4 +1,5 @@
 import numpy as np
+from collections import deque
 from trackers.utils import get_prev_box
 from trackers.kalman_filter import KalmanFilter
 
@@ -65,11 +66,49 @@ class Track(BaseTrack):
         self.alpha = 0.95
         self.feat = detection[6:][np.newaxis, :].copy()
 
-    def update_features(self, feat, score):
-        # Update and normalize
-        beta = self.alpha + (1 - self.alpha) * (1 - score)
-        self.feat = beta * self.feat + (1 - beta) * feat
+        # Audit-only state. This buffer is never read by baseline association.
+        # Each entry is the appearance state immediately before a committed
+        # accepted-match write, so indexing is by write rather than by frame.
+        rollback_writes = getattr(args, 'carf_rollback_writes', [1, 3])
+        max_rollback = max([int(k) for k in rollback_writes] or [1])
+        self._appearance_write_history = deque(maxlen=max_rollback)
+        self.num_feature_writes = 0
+
+    def update_features(self, feat, score, authority=1.0):
+        """Update appearance only; all non-appearance track state is untouched."""
+        authority = float(authority)
+        if not 0.0 <= authority <= 1.0:
+            raise ValueError('authority must be in [0, 1]')
+
+        # A zero-authority observation is not an appearance write.
+        if authority == 0.0:
+            return
+
+        self._appearance_write_history.append(self.feat.copy())
+        self.num_feature_writes += 1
+
+        if authority == 1.0:
+            # Original TrackTrack baseline code path, kept verbatim so the
+            # floating-point operation order is exactly unchanged.
+            beta = self.alpha + (1 - self.alpha) * (1 - score)
+            self.feat = beta * self.feat + (1 - beta) * feat
+            self.feat /= np.linalg.norm(self.feat)
+            return
+
+        beta_base = self.alpha + (1 - self.alpha) * (1 - score)
+        innovation = 1.0 - beta_base
+        effective = authority * innovation
+        self.feat = (1.0 - effective) * self.feat + effective * feat
         self.feat /= np.linalg.norm(self.feat)
+
+    def get_rollback_feature(self, writes):
+        """Return a copied pre-write appearance snapshot or ``None``."""
+        writes = int(writes)
+        if writes <= 0:
+            raise ValueError('writes must be positive')
+        if len(self._appearance_write_history) < writes:
+            return None
+        return self._appearance_write_history[-writes].copy()
 
     def initiate(self, frame_id, counter):
         # Get new track id
@@ -96,11 +135,11 @@ class Track(BaseTrack):
         # Predict
         self.mean, self.covariance = self.kalman_filter.predict(self.mean, self.covariance)
 
-    def update(self, frame_id, detection):
+    def update(self, frame_id, detection, authority=1.0):
         # Update Kalman filter & Feature
         self.mean, self.covariance = self.kalman_filter.update(self.mean, self.covariance,
                                                                detection.cxcywh.copy(), detection.score)
-        self.update_features(detection.feat.copy(), detection.score)
+        self.update_features(detection.feat.copy(), detection.score, authority=authority)
 
         # Update history
         self.history[frame_id] = [detection.box.copy(), detection.score, self.mean.copy(),
