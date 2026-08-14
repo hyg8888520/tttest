@@ -14,6 +14,15 @@ def _feature_cosine(before, after):
     return float(np.dot(before, after) / denominator)
 
 
+def _track_instance_key(track):
+    birth_frame = min(track.history) if track.history else -1
+    return int(track.track_id), int(birth_frame)
+
+
+def _format_track_instance_key(key):
+    return '%d@%d' % key
+
+
 class Tracker(object):
     def __init__(self, args, vid_name, audit_logger=None, oracle=None):
         # Initialize
@@ -41,6 +50,15 @@ class Tracker(object):
         self.carf_soft_power = float(getattr(args, 'carf_soft_power', 1.0))
         self.audit_logger = audit_logger
         self.oracle = oracle
+        self._write_stats = {
+            'accepted_write_opportunities': 0,
+            'gt_labeled_writes': 0,
+            'identity_contaminating_writes': 0,
+            'oracle_blocked_writes': 0,
+            'suppressed_writes': 0,
+            'authority_sum': 0.0,
+        }
+        self._track_write_diagnostics = {}
         self.carf_auditor = None
         if self.carf_enabled:
             self.carf_auditor = CARFAuditor(
@@ -71,9 +89,19 @@ class Tracker(object):
         for t, d in matches:
             track = stage_tracks[t]
             detection = flat_detections[d]
-            rollback_states = {
-                writes: track.get_rollback_feature(writes)
+            rollback_snapshots = {
+                writes: track.get_rollback_snapshot(writes)
                 for writes in self.carf_auditor.rollback_writes
+            }
+            rollback_states = {
+                writes: (None if snapshot is None else snapshot['feature'])
+                for writes, snapshot in rollback_snapshots.items()
+            }
+            rollback_frame_ages = {
+                writes: (None if snapshot is None or
+                         snapshot['frame_id'] is None else
+                         int(self.frame_id - snapshot['frame_id']))
+                for writes, snapshot in rollback_snapshots.items()
             }
             audit = self.carf_auditor.audit_match(
                 baseline_tracker_state=stage_tracks,
@@ -86,38 +114,72 @@ class Tracker(object):
 
             oracle_fields = {
                 'gt_id': None,
-                'canonical_gt_id': None,
-                'oracle_correct_write': None,
+                'oracle_anchor_gt_id': None,
+                'identity_contamination': None,
                 'oracle_unknown': True,
-                'idsw_event': None,
+                'oracle_anchor_created': False,
                 'oracle_label': None,
+                'track_instance_key': _format_track_instance_key(
+                    _track_instance_key(track)),
             }
             if self.oracle is not None:
                 oracle_fields = self.oracle.judge(
-                    self.frame_id, track.track_id, d, flat_detections)
+                    self.frame_id, track, detection)
 
             authority = authority_for_policy(
                 self.carf_policy,
                 audit_result=audit,
                 soft_power=self.carf_soft_power,
-                oracle_correct_write=oracle_fields['oracle_correct_write'],
+                identity_contamination=oracle_fields[
+                    'identity_contamination'],
                 enabled=self.carf_enabled,
             )
             pending.append((t, d, audit, oracle_fields, authority,
-                            track.feat.copy(), track.num_feature_writes))
+                            track.feat.copy(), track.num_feature_writes,
+                            rollback_frame_ages))
 
         # Apply only after every counterfactual has observed the exact state
         # on which the official stage assignment was decoded.
         for (t, d, audit, oracle_fields, authority, feature_before,
-             num_writes) in pending:
+             num_writes, rollback_frame_ages) in pending:
             track = stage_tracks[t]
             detection = flat_detections[d]
+            instance_key = _track_instance_key(track)
+            state = self._track_write_diagnostics.setdefault(instance_key, {
+                'consecutive_q_zero': 0,
+                'max_consecutive_q_zero': 0,
+            })
+            if authority == 0.0:
+                state['consecutive_q_zero'] += 1
+                state['max_consecutive_q_zero'] = max(
+                    state['max_consecutive_q_zero'],
+                    state['consecutive_q_zero'])
+            else:
+                state['consecutive_q_zero'] = 0
             track.update(self.frame_id, detection, authority=authority)
+
+            stats = self._write_stats
+            stats['accepted_write_opportunities'] += 1
+            stats['authority_sum'] += float(authority)
+            if authority < 1.0:
+                stats['suppressed_writes'] += 1
+            contamination = oracle_fields['identity_contamination']
+            if contamination is not None:
+                stats['gt_labeled_writes'] += 1
+            if contamination is True:
+                stats['identity_contaminating_writes'] += 1
+            if (self.carf_policy == 'oracle_gt' and
+                    contamination is True and authority == 0.0):
+                stats['oracle_blocked_writes'] += 1
+
             if self.audit_logger is None:
                 continue
             fields = audit.as_log_fields()
             for writes, survived in audit.rollback_survived.items():
                 fields['rollback_%d_survived' % writes] = survived
+                fields['rollback_%d_frame_age' % writes] = (
+                    rollback_frame_ages[writes])
+            last_update = track.appearance_last_update_frame
             fields.update({
                 'sequence': self.sequence,
                 'frame_id': self.frame_id,
@@ -130,9 +192,37 @@ class Tracker(object):
                 'policy': self.carf_policy,
                 'authority_q': float(authority),
                 'feature_cos_before_after': _feature_cosine(feature_before, track.feat),
+                'consecutive_q_zero': state['consecutive_q_zero'],
+                'max_consecutive_q_zero': state['max_consecutive_q_zero'],
+                'frames_since_last_effective_appearance_update': (
+                    None if last_update is None else
+                    int(self.frame_id - last_update)),
                 **oracle_fields,
             })
             self.audit_logger.write(fields)
+
+    def write_diagnostics_summary(self):
+        stats = dict(self._write_stats)
+        total = stats['accepted_write_opportunities']
+        labeled = stats['gt_labeled_writes']
+        stats['mean_authority_q'] = (
+            stats.pop('authority_sum') / total if total else None)
+        stats['suppressed_write_ratio'] = (
+            stats['suppressed_writes'] / total if total else None)
+        stats['identity_contamination_rate'] = (
+            stats['identity_contaminating_writes'] / labeled
+            if labeled else None)
+        stats['oracle_blocked_rate'] = (
+            stats['oracle_blocked_writes'] / labeled if labeled else None)
+        stats['maximum_consecutive_q_zero_per_track'] = max(
+            (value['max_consecutive_q_zero']
+             for value in self._track_write_diagnostics.values()),
+            default=0)
+        stats['per_track_max_consecutive_q_zero'] = {
+            _format_track_instance_key(key): value['max_consecutive_q_zero']
+            for key, value in sorted(self._track_write_diagnostics.items())
+        }
+        return stats
 
     def init_tracks(self, dets):
         # Get alive tracks, iou_similarity, and scores
@@ -161,6 +251,10 @@ class Tracker(object):
             detection.frame_detection_index = detection_index
         for detection_index, detection in enumerate(dets_del, start=len(dets)):
             detection.frame_detection_index = detection_index
+        if self.oracle is not None:
+            # One frame-global one-to-one GT mapping is shared by both official
+            # association stages. It labels accepted observations only.
+            self.oracle.prepare_frame(self.frame_id, dets + dets_del)
 
         # Divide detections
         dets_high = [d for d in dets if d.score > self.args.det_thr]

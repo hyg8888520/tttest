@@ -27,16 +27,61 @@ def _sequence_lengths(gt_root, sequences):
     return result
 
 
-def _extract_metrics(result, tracker_name):
-    combined = result['MotChallenge2DBox'][tracker_name]['COMBINED_SEQ']['pedestrian']
+def _metric_values(sequence_result):
     return {
-        'HOTA': float(np.mean(combined['HOTA']['HOTA'])),
-        'DetA': float(np.mean(combined['HOTA']['DetA'])),
-        'AssA': float(np.mean(combined['HOTA']['AssA'])),
-        'IDF1': float(combined['Identity']['IDF1']),
-        'IDSW': int(combined['CLEAR']['IDSW']),
-        'MOTA': float(combined['CLEAR']['MOTA']),
-        'Frag': int(combined['CLEAR']['Frag']),
+        'HOTA': float(np.mean(sequence_result['HOTA']['HOTA'])),
+        'DetA': float(np.mean(sequence_result['HOTA']['DetA'])),
+        'AssA': float(np.mean(sequence_result['HOTA']['AssA'])),
+        'IDF1': float(sequence_result['Identity']['IDF1']),
+        'IDSW': int(sequence_result['CLEAR']['IDSW']),
+        'MOTA': float(sequence_result['CLEAR']['MOTA']),
+        'Frag': int(sequence_result['CLEAR']['Frag']),
+    }
+
+
+def _extract_metrics(result, tracker_name, sequences):
+    tracker_result = result['MotChallenge2DBox'][tracker_name]
+    combined = _metric_values(tracker_result['COMBINED_SEQ']['pedestrian'])
+    combined['per_sequence'] = {
+        sequence: _metric_values(tracker_result[sequence]['pedestrian'])
+        for sequence in sequences
+    }
+    return combined
+
+
+def metrics_delta_vs_baseline(baseline, candidate):
+    names = ('HOTA', 'AssA', 'IDF1', 'IDSW')
+    per_sequence = {}
+    baseline_sequences = set(baseline.get('per_sequence', {}))
+    candidate_sequences = set(candidate.get('per_sequence', {}))
+    if baseline_sequences != candidate_sequences:
+        raise ValueError(
+            'baseline/candidate metric sequence sets differ: %s vs %s' %
+            (sorted(baseline_sequences), sorted(candidate_sequences)))
+    common = sorted(baseline_sequences)
+    for sequence in common:
+        per_sequence[sequence] = {
+            'delta_' + name: (
+                candidate['per_sequence'][sequence][name] -
+                baseline['per_sequence'][sequence][name])
+            for name in names
+        }
+    macro = {
+        'delta_' + name: (
+            float(np.mean([values['delta_' + name]
+                           for values in per_sequence.values()]))
+            if per_sequence else None)
+        for name in names
+    }
+    combined = {
+        'delta_' + name: candidate[name] - baseline[name]
+        for name in names
+    }
+    return {
+        'schema_version': 'carf.metrics_delta.v1',
+        'combined_delta': combined,
+        'per_sequence': per_sequence,
+        'macro_mean_per_sequence_delta': macro,
     }
 
 
@@ -83,7 +128,7 @@ def evaluate_results(gt_root, trackers_root, tracker_name, sequences,
     metrics = [trackeval.metrics.HOTA(), trackeval.metrics.CLEAR(),
                trackeval.metrics.Identity()]
     result, _ = evaluator.evaluate(dataset_list, metrics)
-    values = _extract_metrics(result, tracker_name)
+    values = _extract_metrics(result, tracker_name, sequences)
     if output_path:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         with open(output_path, 'w', encoding='utf-8') as handle:

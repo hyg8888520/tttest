@@ -154,6 +154,90 @@ def select_sequences(detections, sequence_names):
     return {name: detections[name] for name in sequence_names}
 
 
+def sanity_check_inputs(detections, detections_95, dataset_root,
+                        sequences, det_thr=0.6):
+    """Fail loudly on cache alignment, shape, scale, and frame-key errors."""
+    report = {
+        'schema_version': 'carf.data_sanity.v1',
+        'alignment_checked_during_load': True,
+        'sequences': {},
+    }
+    for sequence in sequences:
+        if sequence not in detections or sequence not in detections_95:
+            raise KeyError('missing sequence in detection stream: %s' % sequence)
+        image_h, image_w, sequence_length = _sequence_dimensions(
+            dataset_root, sequence)
+        expected_frames = set(range(1, sequence_length + 1))
+        frames = set(int(frame) for frame in detections[sequence])
+        companion_frames = set(int(frame) for frame in detections_95[sequence])
+        if frames != expected_frames:
+            missing = sorted(expected_frames - frames)[:10]
+            extra = sorted(frames - expected_frames)[:10]
+            raise ValueError('%s frame-key mismatch; missing=%s extra=%s' %
+                             (sequence, missing, extra))
+        if companion_frames != expected_frames:
+            raise ValueError('%s companion frame-key mismatch' % sequence)
+
+        counts = {
+            'frames': sequence_length,
+            'nonempty_frames': 0,
+            'detections': 0,
+            'embedding_rows': 0,
+            'high_detections': 0,
+            'low_detections': 0,
+            'companion_detections': 0,
+        }
+        feature_dims = set()
+        tolerance_x = max(2.0, image_w * 0.05)
+        tolerance_y = max(2.0, image_h * 0.05)
+        for frame_id in range(1, sequence_length + 1):
+            rows = detections[sequence][frame_id]
+            companion = detections_95[sequence][frame_id]
+            if companion is not None:
+                companion = np.atleast_2d(_to_numpy(companion))
+                counts['companion_detections'] += len(companion)
+            if rows is None:
+                continue
+            rows = np.atleast_2d(_to_numpy(rows))
+            if rows.shape[1] < 7:
+                raise ValueError(
+                    '%s:%d needs box, score, class slot, and embedding' %
+                    (sequence, frame_id))
+            if not np.isfinite(rows).all():
+                raise ValueError('%s:%d contains non-finite values' %
+                                 (sequence, frame_id))
+            boxes = rows[:, :4]
+            if np.any(boxes[:, 2] <= boxes[:, 0]) or np.any(
+                    boxes[:, 3] <= boxes[:, 1]):
+                raise ValueError('%s:%d has non-positive boxes' %
+                                 (sequence, frame_id))
+            if (np.min(boxes[:, [0, 2]]) < -tolerance_x or
+                    np.max(boxes[:, [0, 2]]) > image_w + tolerance_x or
+                    np.min(boxes[:, [1, 3]]) < -tolerance_y or
+                    np.max(boxes[:, [1, 3]]) > image_h + tolerance_y):
+                raise ValueError(
+                    '%s:%d box range is inconsistent with %dx%d images' %
+                    (sequence, frame_id, image_w, image_h))
+            counts['nonempty_frames'] += 1
+            counts['detections'] += len(rows)
+            counts['embedding_rows'] += len(rows)
+            counts['high_detections'] += int(np.sum(rows[:, 4] > det_thr))
+            counts['low_detections'] += int(np.sum(rows[:, 4] <= det_thr))
+            feature_dims.add(int(rows.shape[1] - 6))
+        if len(feature_dims) > 1:
+            raise ValueError('%s has inconsistent embedding dimensions: %s' %
+                             (sequence, sorted(feature_dims)))
+        counts.update({
+            'image_height': image_h,
+            'image_width': image_w,
+            'embedding_dim': (
+                next(iter(feature_dims)) if feature_dims else None),
+        })
+        report['sequences'][sequence] = counts
+    report['status'] = 'PASS'
+    return report
+
+
 def load_inputs(config, sequences=None):
     inputs = config['inputs']
     input_format = inputs.get('format', 'tracktrack_pickle')

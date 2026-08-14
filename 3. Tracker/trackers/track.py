@@ -73,8 +73,9 @@ class Track(BaseTrack):
         max_rollback = max([int(k) for k in rollback_writes] or [1])
         self._appearance_write_history = deque(maxlen=max_rollback)
         self.num_feature_writes = 0
+        self._appearance_last_update_frame = None
 
-    def update_features(self, feat, score, authority=1.0):
+    def update_features(self, feat, score, authority=1.0, frame_id=None):
         """Update appearance only; all non-appearance track state is untouched."""
         authority = float(authority)
         if not 0.0 <= authority <= 1.0:
@@ -84,7 +85,10 @@ class Track(BaseTrack):
         if authority == 0.0:
             return
 
-        self._appearance_write_history.append(self.feat.copy())
+        self._appearance_write_history.append({
+            'feature': self.feat.copy(),
+            'frame_id': self._appearance_last_update_frame,
+        })
         self.num_feature_writes += 1
 
         if authority == 1.0:
@@ -93,6 +97,7 @@ class Track(BaseTrack):
             beta = self.alpha + (1 - self.alpha) * (1 - score)
             self.feat = beta * self.feat + (1 - beta) * feat
             self.feat /= np.linalg.norm(self.feat)
+            self._appearance_last_update_frame = frame_id
             return
 
         beta_base = self.alpha + (1 - self.alpha) * (1 - score)
@@ -100,15 +105,29 @@ class Track(BaseTrack):
         effective = authority * innovation
         self.feat = (1.0 - effective) * self.feat + effective * feat
         self.feat /= np.linalg.norm(self.feat)
+        self._appearance_last_update_frame = frame_id
 
-    def get_rollback_feature(self, writes):
-        """Return a copied pre-write appearance snapshot or ``None``."""
+    @property
+    def appearance_last_update_frame(self):
+        return self._appearance_last_update_frame
+
+    def get_rollback_snapshot(self, writes):
+        """Return copied appearance state plus its last effective frame."""
         writes = int(writes)
         if writes <= 0:
             raise ValueError('writes must be positive')
         if len(self._appearance_write_history) < writes:
             return None
-        return self._appearance_write_history[-writes].copy()
+        snapshot = self._appearance_write_history[-writes]
+        return {
+            'feature': snapshot['feature'].copy(),
+            'frame_id': snapshot['frame_id'],
+        }
+
+    def get_rollback_feature(self, writes):
+        """Return a copied pre-write appearance snapshot or ``None``."""
+        snapshot = self.get_rollback_snapshot(writes)
+        return None if snapshot is None else snapshot['feature']
 
     def initiate(self, frame_id, counter):
         # Get new track id
@@ -121,6 +140,7 @@ class Track(BaseTrack):
         # Initiate history
         self.history[frame_id] = [self.box.copy(), self.score.copy(), self.mean.copy(),
                                   self.covariance.copy(), self.feat.copy()]
+        self._appearance_last_update_frame = int(frame_id)
 
         # Initiate parameters
         self.end_frame_id = frame_id
@@ -139,7 +159,8 @@ class Track(BaseTrack):
         # Update Kalman filter & Feature
         self.mean, self.covariance = self.kalman_filter.update(self.mean, self.covariance,
                                                                detection.cxcywh.copy(), detection.score)
-        self.update_features(detection.feat.copy(), detection.score, authority=authority)
+        self.update_features(detection.feat.copy(), detection.score,
+                             authority=authority, frame_id=frame_id)
 
         # Update history
         self.history[frame_id] = [detection.box.copy(), detection.score, self.mean.copy(),

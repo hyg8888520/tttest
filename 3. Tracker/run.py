@@ -6,10 +6,10 @@ import time
 from utils.etc import *
 from trackers.tracker import Tracker
 from carf.config import load_config, load_manifest, require_resolved
-from carf.evaluation import evaluate_results
-from carf.inputs import load_inputs
+from carf.evaluation import evaluate_results, metrics_delta_vs_baseline
+from carf.inputs import load_inputs, sanity_check_inputs
 from carf.logging import AuditJSONLWriter
-from carf.oracle import OfflineGTOracle
+from carf.oracle import OnlineGTAnchorOracle
 
 
 def make_parser():
@@ -24,6 +24,8 @@ def make_parser():
     parser.add_argument("--seed", type=float, default=10000)
     parser.add_argument("--config", type=str, default=None,
                         help="CARF experiment YAML")
+    parser.add_argument("--sanity-only", action="store_true",
+                        help="validate configured caches and exit")
 
     # For trackers
     parser.add_argument("--min_len", type=int, default=3)
@@ -64,30 +66,57 @@ def _configured_sequences(config):
     manifest_path = require_resolved(
         config['dataset']['split_manifest'], 'dataset.split_manifest')
     manifest = load_manifest(manifest_path)
-    split = config['dataset'].get('split', 'development')
+    split = config['dataset'].get('split', 'development_core')
     if split not in manifest:
         raise KeyError('split %s not found in %s' % (split, manifest_path))
     if (split == 'official_test' and
-            config.get('evaluation', {}).get('enabled') and
             not config.get('experiment', {}).get('frozen', False)):
         raise ValueError(
-            'official_test evaluation requires experiment.frozen=true; '
-            'do not use it for tuning')
+            'official_test runs require experiment.frozen=true; '
+            'do not use them for tuning')
     return list(manifest[split])
 
 
 def _configured_oracle(config, sequence, required=False):
     oracle_config = config.get('oracle', {})
-    artifact = oracle_config.get('artifact')
-    if artifact and '${' not in str(artifact) and os.path.isfile(artifact):
-        return OfflineGTOracle(
-            require_resolved(config['dataset']['gt_root'], 'dataset.gt_root'),
-            artifact, sequence,
-            threshold=oracle_config.get('iou_threshold', 0.5))
-    if required:
-        require_resolved(artifact, 'oracle.artifact')
-        raise FileNotFoundError('oracle artifact not found: %s' % artifact)
-    return None
+    gt_root = config['dataset'].get('gt_root')
+    if gt_root is None or '${' in str(gt_root):
+        if required:
+            require_resolved(gt_root, 'dataset.gt_root')
+        return None
+    return OnlineGTAnchorOracle(
+        require_resolved(gt_root, 'dataset.gt_root'), sequence,
+        threshold=oracle_config.get('iou_threshold', 0.5))
+
+
+def _combined_write_diagnostics(per_sequence):
+    count_names = (
+        'accepted_write_opportunities', 'gt_labeled_writes',
+        'identity_contaminating_writes', 'oracle_blocked_writes',
+        'suppressed_writes')
+    combined = {
+        name: sum(values[name] for values in per_sequence.values())
+        for name in count_names
+    }
+    total = combined['accepted_write_opportunities']
+    labeled = combined['gt_labeled_writes']
+    combined['mean_authority_q'] = (
+        sum(values['mean_authority_q'] *
+            values['accepted_write_opportunities']
+            for values in per_sequence.values()
+            if values['mean_authority_q'] is not None) / total
+        if total else None)
+    combined['suppressed_write_ratio'] = (
+        combined['suppressed_writes'] / total if total else None)
+    combined['identity_contamination_rate'] = (
+        combined['identity_contaminating_writes'] / labeled
+        if labeled else None)
+    combined['oracle_blocked_rate'] = (
+        combined['oracle_blocked_writes'] / labeled if labeled else None)
+    combined['maximum_consecutive_q_zero_per_track'] = max(
+        (values['maximum_consecutive_q_zero_per_track']
+         for values in per_sequence.values()), default=0)
+    return combined
 
 
 def run_configured(config_path, overrides):
@@ -102,6 +131,18 @@ def run_configured(config_path, overrides):
         config['output']['root'], 'output.root'))
     detections, detections_95 = load_inputs(config, sequences=sequences)
 
+    if args.sanity_only:
+        sanity = sanity_check_inputs(
+            detections, detections_95,
+            require_resolved(config['dataset']['root'], 'dataset.root'),
+            sequences, det_thr=args.det_thr)
+        os.makedirs(output_root, exist_ok=True)
+        sanity_path = os.path.join(output_root, 'data_sanity.json')
+        with open(sanity_path, 'w', encoding='utf-8') as handle:
+            json.dump(sanity, handle, indent=2, sort_keys=True)
+        print(json.dumps(sanity, indent=2, sort_keys=True), flush=True)
+        return
+
     run_name = args.carf_policy if args.carf_enabled else 'baseline'
     run_root = os.path.join(output_root, run_name)
     result_folder = os.path.join(run_root, 'data')
@@ -110,13 +151,17 @@ def run_configured(config_path, overrides):
     logger = None
     if args.carf_enabled and args.carf_policy != 'baseline':
         logger = AuditJSONLWriter(
-            log_path, config.get('carf', {}).get('log_schema', 'carf.audit.v1'))
+            log_path, config.get('carf', {}).get('log_schema', 'carf.audit.v2'))
 
     total_time, total_count = 0.0, 0
+    write_diagnostics = {}
     try:
         for vid_name in sequences:
-            oracle = _configured_oracle(
-                config, vid_name, required=args.carf_policy == 'oracle_gt')
+            oracle = None
+            if args.carf_enabled and args.carf_policy != 'baseline':
+                oracle = _configured_oracle(
+                    config, vid_name,
+                    required=args.carf_policy == 'oracle_gt')
             tracker = Tracker(args, vid_name, audit_logger=logger, oracle=oracle)
             results = []
             for frame_id in sorted(detections[vid_name]):
@@ -139,6 +184,9 @@ def run_configured(config_path, overrides):
                         scores.append(track_result.score)
                 results.append([frame_id, track_ids, x1y1whs, scores])
             write_results(os.path.join(result_folder, vid_name + '.txt'), results)
+            if args.carf_enabled and args.carf_policy != 'baseline':
+                write_diagnostics[vid_name] = (
+                    tracker.write_diagnostics_summary())
     finally:
         if logger is not None:
             logger.close()
@@ -157,6 +205,17 @@ def run_configured(config_path, overrides):
         json.dump(performance, handle, indent=2, sort_keys=True)
     print(json.dumps(performance, sort_keys=True), flush=True)
 
+    if write_diagnostics:
+        diagnostic_payload = {
+            'schema_version': 'carf.write_diagnostics.v1',
+            'policy': run_name,
+            'combined': _combined_write_diagnostics(write_diagnostics),
+            'per_sequence': write_diagnostics,
+        }
+        with open(os.path.join(run_root, 'write_diagnostics.json'), 'w',
+                  encoding='utf-8') as handle:
+            json.dump(diagnostic_payload, handle, indent=2, sort_keys=True)
+
     evaluation = config.get('evaluation', {})
     if evaluation.get('enabled', False):
         metrics = evaluate_results(
@@ -166,6 +225,16 @@ def run_configured(config_path, overrides):
             benchmark=evaluation.get('benchmark', 'BEE24'),
             do_preproc=evaluation.get('do_preproc', False))
         print(json.dumps(metrics, sort_keys=True), flush=True)
+        baseline_metrics_path = os.path.join(
+            output_root, 'baseline', 'metrics.json')
+        if run_name != 'baseline' and os.path.isfile(baseline_metrics_path):
+            with open(baseline_metrics_path, 'r', encoding='utf-8') as handle:
+                baseline_metrics = json.load(handle)
+            delta = metrics_delta_vs_baseline(baseline_metrics, metrics)
+            with open(os.path.join(run_root,
+                                   'metrics_delta_vs_baseline.json'),
+                      'w', encoding='utf-8') as handle:
+                json.dump(delta, handle, indent=2, sort_keys=True)
 
 
 def track(detections, detections_95, data_path, result_folder, mode):

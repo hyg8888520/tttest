@@ -5,7 +5,7 @@ VALID_POLICIES = {'baseline', 'audit_only', 'hard', 'soft', 'oracle_gt'}
 
 
 def authority_for_policy(policy, audit_result=None, soft_power=1.0,
-                         oracle_correct_write=None, enabled=True):
+                         identity_contamination=None, enabled=True):
     """Return q in [0, 1] without changing the accepted assignment.
 
     Missing rollback history and unknown oracle labels always fall back to the
@@ -17,7 +17,7 @@ def authority_for_policy(policy, audit_result=None, soft_power=1.0,
         return 1.0
 
     if policy == 'oracle_gt':
-        if oracle_correct_write is False:
+        if identity_contamination is True:
             return 0.0
         return 1.0
 

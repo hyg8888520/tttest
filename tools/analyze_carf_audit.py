@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Analyze versioned CARF JSONL logs without fitting a predictor."""
+"""Minimal CARF V2 identity-contamination signal analysis."""
 
 import argparse
 import csv
 from collections import defaultdict
 import json
-import math
 import os
 
 import numpy as np
@@ -19,39 +18,20 @@ def read_jsonl(paths):
                 if not line.strip():
                     continue
                 row = json.loads(line)
-                if row.get('schema_version') != 'carf.audit.v1':
-                    raise ValueError('%s:%d has unsupported schema %r' %
+                if row.get('schema_version') != 'carf.audit.v2':
+                    raise ValueError('%s:%d requires carf.audit.v2, got %r' %
                                      (path, line_number,
                                       row.get('schema_version')))
                 rows.append(row)
     return rows
 
 
-def describe(values):
-    values = np.asarray(list(values), dtype=float)
-    if not len(values):
-        return {'count': 0, 'mean': None, 'std': None, 'min': None,
-                'q25': None, 'median': None, 'q75': None, 'max': None}
-    return {
-        'count': int(len(values)),
-        'mean': float(np.mean(values)),
-        'std': float(np.std(values)),
-        'min': float(np.min(values)),
-        'q25': float(np.quantile(values, .25)),
-        'median': float(np.quantile(values, .5)),
-        'q75': float(np.quantile(values, .75)),
-        'max': float(np.max(values)),
-    }
+def _rate(numerator, denominator):
+    return numerator / denominator if denominator else None
 
 
-def probability(numerator_rows, denominator_rows):
-    if not denominator_rows:
-        return None
-    return sum(bool(row['oracle_correct_write'] is False)
-               for row in numerator_rows) / len(denominator_rows)
-
-
-def average_ranks(values):
+def _average_ranks(values):
+    values = np.asarray(values, dtype=float)
     order = np.argsort(values, kind='mergesort')
     ranks = np.empty(len(values), dtype=float)
     position = 0
@@ -64,169 +44,109 @@ def average_ranks(values):
     return ranks
 
 
-def auroc(scores, labels):
-    scores = np.asarray(scores, dtype=float)
+def _auroc(scores, labels):
     labels = np.asarray(labels, dtype=bool)
-    positives, negatives = int(labels.sum()), int((~labels).sum())
+    positives = int(labels.sum())
+    negatives = int((~labels).sum())
     if positives == 0 or negatives == 0:
         return None
-    ranks = average_ranks(scores)
+    ranks = _average_ranks(scores)
     return float((ranks[labels].sum() - positives * (positives + 1) / 2) /
                  (positives * negatives))
 
 
-def spearman(xs, ys):
-    if len(xs) < 2 or len(set(xs)) < 2 or len(set(ys)) < 2:
-        return None
-    xr, yr = average_ranks(np.asarray(xs)), average_ranks(np.asarray(ys))
-    return float(np.corrcoef(xr, yr)[0, 1])
-
-
-def sequence_summary(rows):
-    auditable = [row for row in rows if row.get('auditable')]
-    labelled = [row for row in auditable
-                if row.get('oracle_correct_write') is not None]
-    wrong = [row for row in labelled if row['oracle_correct_write'] is False]
+def _describe(values):
+    values = [float(value) for value in values if value is not None]
+    if not values:
+        return {'count': 0, 'mean': None, 'max': None}
     return {
-        'writes': len(rows),
-        'auditable_writes': len(auditable),
-        'auditable_coverage': len(auditable) / len(rows) if rows else None,
-        'fragility': describe(row['F_ij'] for row in auditable),
-        'oracle_labelled_writes': len(labelled),
-        'oracle_wrong_writes': len(wrong),
-        'wrong_write_rate': len(wrong) / len(labelled) if labelled else None,
+        'count': len(values),
+        'mean': float(np.mean(values)),
+        'max': float(np.max(values)),
     }
 
 
-def idsw_enrichment(auditable_rows):
-    global_f = [row['F_ij'] for row in auditable_rows]
-    global_positive = np.mean([value > 0 for value in global_f]) if global_f else None
-    global_mean = np.mean(global_f) if global_f else None
-    switch_frames = defaultdict(set)
-    for row in auditable_rows:
-        if row.get('idsw_event'):
-            switch_frames[row['sequence']].add(int(row['frame_id']))
+def _f_table(population):
     result = {}
-    for window in (1, 3, 5):
-        selected = []
-        for row in auditable_rows:
-            frame = int(row['frame_id'])
-            if any(switch - window <= frame < switch
-                   for switch in switch_frames[row['sequence']]):
-                selected.append(row['F_ij'])
-        selected_mean = float(np.mean(selected)) if selected else None
-        selected_positive = (float(np.mean([value > 0 for value in selected]))
-                             if selected else None)
-        result[str(window)] = {
-            'num_writes': len(selected),
-            'mean_fragility': selected_mean,
-            'mean_fragility_enrichment': (
-                selected_mean / global_mean
-                if selected_mean is not None and global_mean not in (None, 0) else None),
-            'positive_fragility_rate': selected_positive,
-            'positive_fragility_enrichment': (
-                selected_positive / global_positive
-                if selected_positive is not None and global_positive not in (None, 0) else None),
-        }
-    return result
-
-
-def persistence_analysis(rows):
-    """Relate first wrong accepted-write F to span until next known clean write."""
-    grouped = defaultdict(list)
-    for row in rows:
-        if row.get('auditable') and row.get('oracle_correct_write') is not None:
-            grouped[(row['sequence'], int(row['track_id']))].append(row)
-    events = []
-    for (sequence, track_id), track_rows in grouped.items():
-        track_rows.sort(key=lambda row: int(row['frame_id']))
-        active = None
-        for row in track_rows:
-            wrong = row['oracle_correct_write'] is False
-            if wrong and active is None:
-                active = {'sequence': sequence, 'track_id': track_id,
-                          'start': int(row['frame_id']),
-                          'end': int(row['frame_id']),
-                          'trigger_fragility': float(row['F_ij']),
-                          'wrong_writes': 1}
-            elif wrong:
-                active['end'] = int(row['frame_id'])
-                active['wrong_writes'] += 1
-            elif active is not None:
-                active['duration_frames'] = active['end'] - active['start'] + 1
-                events.append(active)
-                active = None
-        if active is not None:
-            active['duration_frames'] = active['end'] - active['start'] + 1
-            events.append(active)
-    return {
-        'definition': 'wrong accepted-write span until next known clean accepted write',
-        'num_events': len(events),
-        'duration_frames': describe(event['duration_frames'] for event in events),
-        'spearman_trigger_fragility_vs_duration': spearman(
-            [event['trigger_fragility'] for event in events],
-            [event['duration_frames'] for event in events]),
-        'events': events,
-    }
-
-
-def rollback_contributions(rows):
-    keys = sorted({key for row in rows for key in row
-                   if key.startswith('rollback_') and key.endswith('_survived')},
-                  key=lambda key: int(key.split('_')[1]))
-    result = {}
-    for key in keys:
-        valid = [row[key] for row in rows if row.get(key) is not None]
+    for value in (0.0, 0.5, 1.0):
+        selected = [row for row in population
+                    if abs(float(row['F_ij']) - value) < 1e-12]
+        contamination_count = sum(
+            row['identity_contamination'] is True for row in selected)
+        key = str(value).rstrip('0').rstrip('.') if value else '0'
         result[key] = {
-            'valid': len(valid),
-            'survival_rate': float(np.mean(valid)) if valid else None,
-            'fragility_contribution': float(1.0 - np.mean(valid)) if valid else None,
-        }
-    if len(keys) >= 2:
-        first, last = keys[0], keys[-1]
-        paired = [row for row in rows
-                  if row.get(first) is not None and row.get(last) is not None]
-        result['paired'] = {
-            'count': len(paired),
-            'rollback_1_only_failure': sum(
-                row[first] is False and row[last] is True for row in paired),
-            'rollback_k_only_failure': sum(
-                row[first] is True and row[last] is False for row in paired),
-            'both_fail': sum(
-                row[first] is False and row[last] is False for row in paired),
+            'N': len(selected),
+            'contamination_count': contamination_count,
+            'contamination_rate': _rate(contamination_count, len(selected)),
         }
     return result
+
+
+def population_summary(rows):
+    labeled = [row for row in rows
+               if row.get('identity_contamination') is not None]
+    auditable = [row for row in rows if row.get('auditable')]
+    auditable_labeled = [row for row in auditable
+                         if row.get('identity_contamination') is not None]
+    contaminated_labeled = sum(
+        row['identity_contamination'] is True for row in labeled)
+    contaminated_auditable = sum(
+        row['identity_contamination'] is True for row in auditable_labeled)
+    table = _f_table(auditable_labeled)
+    baseline_rate = _rate(contaminated_auditable, len(auditable_labeled))
+    f1_rate = table['1']['contamination_rate']
+    risk_lift = (f1_rate / baseline_rate
+                 if f1_rate is not None and baseline_rate not in (None, 0)
+                 else None)
+    return {
+        'total_accepted_edges': len(rows),
+        'gt_labeled_accepted_edges': len(labeled),
+        'auditable_accepted_edges': len(auditable),
+        'gt_labeled_and_auditable_edges': len(auditable_labeled),
+        'gt_label_coverage': _rate(len(labeled), len(rows)),
+        'auditable_coverage': _rate(len(auditable), len(rows)),
+        'overall_contamination_rate_gt_labeled': _rate(
+            contaminated_labeled, len(labeled)),
+        'contamination_rate_gt_labeled_and_auditable': baseline_rate,
+        'fragility_table': table,
+        'risk_lift_F_eq_1_vs_auditable_labeled': risk_lift,
+        'secondary_auroc': _auroc(
+            [row['F_ij'] for row in auditable_labeled],
+            [row['identity_contamination'] is True
+             for row in auditable_labeled]),
+        'mean_authority_q': (
+            float(np.mean([row['authority_q'] for row in rows]))
+            if rows else None),
+        'suppressed_write_ratio': _rate(
+            sum(float(row['authority_q']) < 1.0 for row in rows), len(rows)),
+        'maximum_consecutive_q_zero': max(
+            (int(row.get('max_consecutive_q_zero', 0)) for row in rows),
+            default=0),
+        'frames_since_last_effective_update': _describe(
+            row.get('frames_since_last_effective_appearance_update')
+            for row in rows),
+        'rollback_1_frame_age': _describe(
+            row.get('rollback_1_frame_age') for row in rows),
+        'rollback_3_frame_age': _describe(
+            row.get('rollback_3_frame_age') for row in rows),
+    }
 
 
 def analyze(rows):
-    auditable = [row for row in rows if row.get('auditable')]
-    labelled = [row for row in auditable
-                if row.get('oracle_correct_write') is not None]
-    wrong = [row for row in labelled if row['oracle_correct_write'] is False]
-    clean = [row for row in labelled if row['oracle_correct_write'] is True]
-    f_zero = [row for row in labelled if float(row['F_ij']) == 0.0]
-    f_positive = [row for row in labelled if float(row['F_ij']) > 0.0]
     by_sequence = defaultdict(list)
     for row in rows:
         by_sequence[row['sequence']].append(row)
     return {
-        'schema_version': 'carf.analysis.v1',
-        'analysis_population': 'fully auditable writes for F/wrong-write statistics',
-        'writes': len(rows),
-        'auditable_coverage': len(auditable) / len(rows) if rows else None,
-        'fragility_overall': describe(row['F_ij'] for row in auditable),
-        'fragility_clean_write': describe(row['F_ij'] for row in clean),
-        'fragility_oracle_wrong_write': describe(row['F_ij'] for row in wrong),
-        'P_wrong_write_given_F_eq_0': probability(f_zero, f_zero),
-        'P_wrong_write_given_F_gt_0': probability(f_positive, f_positive),
-        'wrong_write_auroc': auroc(
-            [row['F_ij'] for row in labelled],
-            [row['oracle_correct_write'] is False for row in labelled]),
-        'idsw_preceding_fragility_enrichment': idsw_enrichment(auditable),
-        'wrong_persistence_vs_trigger_fragility': persistence_analysis(rows),
-        'rollback_independent_contribution': rollback_contributions(rows),
+        'schema_version': 'carf.analysis.v2',
+        'label_definition': (
+            'identity_contamination means the accepted observation GT identity '
+            'differs from the immutable online track-instance anchor'),
+        'fragility_semantics': (
+            'counterfactual association sensitivity, not a calibrated '
+            'probability or complete harmful-write ground truth'),
+        'combined': population_summary(rows),
         'per_sequence': {
-            sequence: sequence_summary(sequence_rows)
+            sequence: population_summary(sequence_rows)
             for sequence, sequence_rows in sorted(by_sequence.items())
         },
     }
@@ -234,23 +154,19 @@ def analyze(rows):
 
 def write_sequence_csv(path, per_sequence):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    fieldnames = [
+        'sequence', 'total_accepted_edges', 'gt_labeled_accepted_edges',
+        'auditable_accepted_edges', 'gt_labeled_and_auditable_edges',
+        'gt_label_coverage', 'auditable_coverage',
+        'overall_contamination_rate_gt_labeled',
+        'contamination_rate_gt_labeled_and_auditable',
+        'risk_lift_F_eq_1_vs_auditable_labeled']
     with open(path, 'w', newline='', encoding='utf-8') as handle:
-        writer = csv.DictWriter(handle, fieldnames=[
-            'sequence', 'writes', 'auditable_writes', 'auditable_coverage',
-            'mean_fragility', 'oracle_labelled_writes',
-            'oracle_wrong_writes', 'wrong_write_rate'])
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for sequence, values in per_sequence.items():
-            writer.writerow({
-                'sequence': sequence,
-                'writes': values['writes'],
-                'auditable_writes': values['auditable_writes'],
-                'auditable_coverage': values['auditable_coverage'],
-                'mean_fragility': values['fragility']['mean'],
-                'oracle_labelled_writes': values['oracle_labelled_writes'],
-                'oracle_wrong_writes': values['oracle_wrong_writes'],
-                'wrong_write_rate': values['wrong_write_rate'],
-            })
+            writer.writerow({'sequence': sequence, **{
+                name: values[name] for name in fieldnames[1:]}})
 
 
 def main():

@@ -1,10 +1,10 @@
-"""Offline GT oracle write protection.
+"""GT utilities for offline diagnostics and the online-anchor Oracle.
 
 OFFLINE ORACLE - NOT A DEPLOYABLE METHOD.
 
-Canonical identities are prepared from a complete baseline result sequence.
-The live tracker still accepts and outputs its own baseline association; this
-module only decides whether that accepted observation may write appearance.
+The execution Oracle anchors each live track instance to its first valid,
+frame-local GT observation. GT is consulted only after TrackTrack has accepted
+an edge, and can only control the subsequent appearance write.
 """
 
 from collections import Counter, defaultdict
@@ -19,6 +19,8 @@ from trackeval.datasets._base_dataset import _BaseDataset
 
 ORACLE_SCHEMA_VERSION = 'carf.oracle.v1'
 ORACLE_LABEL = 'OFFLINE ORACLE - NOT A DEPLOYABLE METHOD'
+ONLINE_ORACLE_LABEL = (
+    'OFFLINE ORACLE - NOT A DEPLOYABLE METHOD: online GT identity anchor')
 
 
 def _as_2d(rows):
@@ -57,6 +59,99 @@ def _iou_xywh(gt_boxes, tracker_boxes):
         np.asarray(gt_boxes, dtype=np.float64),
         np.asarray(tracker_boxes, dtype=np.float64),
         box_format='xywh')
+
+
+def match_detections_to_gt(gt_rows, detections, threshold=0.5):
+    """Return a deterministic one-to-one frame detection -> GT-ID mapping.
+
+    This Hungarian matching labels observations only. It is not TrackTrack's
+    association decoder and its result is never supplied to the tracker.
+    """
+    gt_rows = _as_2d(gt_rows)
+    if len(gt_rows) == 0 or len(detections) == 0:
+        return {}
+    det_xyxy = np.asarray(
+        [detection.x1y1x2y2 for detection in detections], dtype=np.float64)
+    similarity = _iou_xywh(gt_rows[:, 2:6], _xyxy_to_xywh(det_xyxy))
+    scores = similarity.copy()
+    scores[similarity < float(threshold) - np.finfo(float).eps] = 0.0
+    rows, cols = linear_sum_assignment(-scores)
+    valid = scores[rows, cols] > np.finfo(float).eps
+    mapping = {}
+    for row, col in zip(rows[valid], cols[valid]):
+        detection_index = int(getattr(
+            detections[int(col)], 'frame_detection_index', int(col)))
+        mapping[detection_index] = int(gt_rows[int(row), 1])
+    return mapping
+
+
+class OnlineGTAnchorOracle:
+    """Per-track-instance online GT anchor for write protection only.
+
+    The first valid GT identity accepted by a track instance becomes its
+    immutable anchor. Unknown observations never create or modify an anchor and
+    always fall back to baseline write authority.
+    """
+
+    label = ONLINE_ORACLE_LABEL
+
+    def __init__(self, gt_root, sequence, threshold=0.5):
+        self.sequence = sequence
+        self.threshold = float(threshold)
+        gt_rows = load_mot_rows(resolve_gt_path(gt_root, sequence))
+        self.gt_frames = rows_by_frame(gt_rows, is_gt=True)
+        self.anchors = {}
+        self._prepared_frame = None
+        self._frame_detection_gt = {}
+
+    @staticmethod
+    def instance_key(track):
+        if not track.history:
+            raise ValueError('accepted track has no birth history')
+        return int(track.track_id), int(min(track.history))
+
+    @staticmethod
+    def format_instance_key(key):
+        return '%d@%d' % (int(key[0]), int(key[1]))
+
+    def prepare_frame(self, frame_id, detections):
+        """Match the complete frame observation set exactly once."""
+        frame_id = int(frame_id)
+        gt = self.gt_frames.get(frame_id, np.empty((0, 10)))
+        self._frame_detection_gt = match_detections_to_gt(
+            gt, detections, threshold=self.threshold)
+        self._prepared_frame = frame_id
+        return dict(self._frame_detection_gt)
+
+    def judge(self, frame_id, track, detection):
+        """Label one already-accepted edge and update only oracle state."""
+        frame_id = int(frame_id)
+        if self._prepared_frame != frame_id:
+            raise RuntimeError(
+                'prepare_frame must be called before judging accepted edges')
+        detection_index = int(getattr(detection, 'frame_detection_index'))
+        gt_id = self._frame_detection_gt.get(detection_index)
+        key = self.instance_key(track)
+        anchor = self.anchors.get(key)
+        anchor_created = False
+        if gt_id is None:
+            contamination = None
+        elif anchor is None:
+            anchor = int(gt_id)
+            self.anchors[key] = anchor
+            anchor_created = True
+            contamination = False
+        else:
+            contamination = int(gt_id) != int(anchor)
+        return {
+            'gt_id': gt_id,
+            'oracle_anchor_gt_id': anchor,
+            'identity_contamination': contamination,
+            'oracle_unknown': gt_id is None,
+            'oracle_anchor_created': anchor_created,
+            'oracle_label': self.label,
+            'track_instance_key': self.format_instance_key(key),
+        }
 
 
 def clear_sequence_matches(gt_frames, tracker_frames, threshold=0.5):

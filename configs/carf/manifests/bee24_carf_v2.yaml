@@ -1,0 +1,70 @@
+schema_version: carf.split.v2
+dataset: BEE24
+source:
+  videos: 36
+  official_test_source: TOPICTrack/results/gt/seqmaps/BEE24-val.txt
+  note: Sequence IDs use the exact TOPIC cache spelling without hyphens.
+
+# Minimal real-data Gate 0 only.
+gate0:
+  - BEE2406
+  - BEE2414
+
+# Chosen development mechanisms; this is not described as a 20% validation split.
+development_core:
+  - BEE2406
+  - BEE2410
+  - BEE2414
+  - BEE2415
+  - BEE2426
+  - BEE2429
+
+development_long:
+  - BEE2435
+
+# Convenience union for the online Oracle experiment.
+oracle_development:
+  - BEE2406
+  - BEE2410
+  - BEE2414
+  - BEE2415
+  - BEE2426
+  - BEE2429
+  - BEE2435
+
+stress_dense_long:
+  - BEE2433
+
+# Remaining official-train sequences, excluding the development/stress groups.
+project_train:
+  - BEE2401
+  - BEE2402
+  - BEE2403
+  - BEE2404
+  - BEE2405
+  - BEE2407
+  - BEE2408
+  - BEE2409
+  - BEE2411
+  - BEE2417
+  - BEE2419
+  - BEE2421
+  - BEE2422
+  - BEE2423
+  - BEE2424
+  - BEE2425
+  - BEE2427
+  - BEE2428
+  - BEE2430
+  - BEE2431
+  - BEE2432
+  - BEE2434
+  - BEE2436
+
+# Frozen official TOPICTrack seqmap. Never tune on these sequences.
+official_test:
+  - BEE2412
+  - BEE2413
+  - BEE2416
+  - BEE2418
+  - BEE2420

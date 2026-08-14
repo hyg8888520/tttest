@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare modal baseline-track GT identities for the offline oracle."""
+"""Deprecated diagnostic: prepare modal baseline-track GT identities."""
 
 import argparse
 import os
@@ -19,7 +19,7 @@ def main():
     parser.add_argument('--tracker-results', required=True,
                         help='baseline MOT txt directory (the data/ directory)')
     parser.add_argument('--manifest', required=True)
-    parser.add_argument('--split', default='development')
+    parser.add_argument('--split', default='development_core')
     parser.add_argument('--output', required=True)
     parser.add_argument('--iou-threshold', type=float, default=0.5)
     args = parser.parse_args()

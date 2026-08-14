@@ -5,7 +5,7 @@ import os
 import threading
 
 
-SCHEMA_VERSION = 'carf.audit.v1'
+SCHEMA_VERSION = 'carf.audit.v2'
 
 
 class AuditJSONLWriter:

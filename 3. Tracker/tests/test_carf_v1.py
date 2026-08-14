@@ -1,14 +1,22 @@
 import unittest
 from types import SimpleNamespace
+import importlib.util
 import os
 import pickle
+import sys
 import tempfile
 
 import numpy as np
 
+TRACKER_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+if TRACKER_ROOT not in sys.path:
+    sys.path.insert(0, TRACKER_ROOT)
+
 from carf.auditor import CARFAuditor
 from carf.policies import authority_for_policy
-from carf.inputs import load_topic_cache
+from carf.inputs import load_topic_cache, sanity_check_inputs
+from carf.evaluation import metrics_delta_vs_baseline
+from carf.oracle import OnlineGTAnchorOracle, match_detections_to_gt
 from trackers.track import Track, TrackCounter
 from trackers.tracker import Tracker
 from trackers.utils import iterative_assignment
@@ -225,6 +233,190 @@ class TestBEE24Adapter(unittest.TestCase):
             np.testing.assert_array_equal(converted[sequence][1][:, 6:],
                                           np.eye(2))
             self.assertIsNone(converted[sequence][2])
+            sanity = sanity_check_inputs(
+                converted, converted, root, [sequence], det_thr=.6)
+            self.assertEqual(sanity['status'], 'PASS')
+            self.assertEqual(
+                sanity['sequences'][sequence]['detections'], 2)
+
+
+class TestOnlineGTAnchorOracle(unittest.TestCase):
+    sequence = 'BEE2406'
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        gt_dir = os.path.join(
+            self.tempdir.name, self.sequence, 'gt')
+        os.makedirs(gt_dir)
+        rows = np.asarray([
+            [1, 101, 0, 0, 10, 10, 1, 1, 1],
+            [2, 202, 0, 0, 10, 10, 1, 1, 1],
+            [3, 101, 0, 0, 10, 10, 1, 1, 1],
+            [6, 202, 0, 0, 10, 10, 1, 1, 1],
+        ], dtype=float)
+        np.savetxt(os.path.join(gt_dir, 'gt.txt'), rows, delimiter=',')
+        self.oracle = OnlineGTAnchorOracle(
+            self.tempdir.name, self.sequence, threshold=0.5)
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    @staticmethod
+    def observation(feature=(1.0, 0.0), box=(0, 0, 10, 10)):
+        item = Track(args(), detection(feature, box=box))
+        item.frame_detection_index = 0
+        return item
+
+    def test_online_anchor_created_on_first_valid_gt_identity(self):
+        track = initiated_track()
+        observation = self.observation()
+        self.oracle.prepare_frame(1, [observation])
+        result = self.oracle.judge(1, track, observation)
+        self.assertTrue(result['oracle_anchor_created'])
+        self.assertEqual(result['oracle_anchor_gt_id'], 101)
+        self.assertFalse(result['identity_contamination'])
+
+    def test_frame_gt_matching_is_one_to_one(self):
+        first = self.observation()
+        second = self.observation()
+        second.frame_detection_index = 1
+        gt = self.oracle.gt_frames[1]
+        mapping = match_detections_to_gt(gt, [first, second], threshold=0.5)
+        self.assertEqual(len(mapping), 1)
+        self.assertEqual(list(mapping.values()), [101])
+
+    def test_online_anchor_never_changes(self):
+        track = initiated_track()
+        observation = self.observation()
+        self.oracle.prepare_frame(1, [observation])
+        self.oracle.judge(1, track, observation)
+        self.oracle.prepare_frame(2, [observation])
+        result = self.oracle.judge(2, track, observation)
+        self.assertEqual(result['oracle_anchor_gt_id'], 101)
+        self.assertTrue(result['identity_contamination'])
+        self.assertEqual(self.oracle.anchors[(track.track_id, 1)], 101)
+
+    def test_unknown_gt_does_not_suppress_or_create_anchor(self):
+        track = initiated_track()
+        observation = self.observation()
+        self.oracle.prepare_frame(4, [observation])
+        result = self.oracle.judge(4, track, observation)
+        self.assertTrue(result['oracle_unknown'])
+        self.assertIsNone(result['identity_contamination'])
+        self.assertEqual(self.oracle.anchors, {})
+        self.assertEqual(authority_for_policy(
+            'oracle_gt', identity_contamination=None), 1.0)
+
+    def test_cross_identity_detection_gives_zero_authority(self):
+        track = initiated_track()
+        observation = self.observation()
+        self.oracle.prepare_frame(1, [observation])
+        self.oracle.judge(1, track, observation)
+        self.oracle.prepare_frame(2, [observation])
+        result = self.oracle.judge(2, track, observation)
+        self.assertEqual(authority_for_policy(
+            'oracle_gt', identity_contamination=result[
+                'identity_contamination']), 0.0)
+
+    def test_track_instance_reuse_does_not_inherit_anchor(self):
+        first = initiated_track()
+        observation = self.observation()
+        self.oracle.prepare_frame(1, [observation])
+        self.oracle.judge(1, first, observation)
+
+        reused = Track(args(), detection((1.0, 0.0)))
+        reused.initiate(5, TrackCounter())
+        self.assertEqual(first.track_id, reused.track_id)
+        self.oracle.prepare_frame(6, [observation])
+        result = self.oracle.judge(6, reused, observation)
+        self.assertTrue(result['oracle_anchor_created'])
+        self.assertEqual(result['oracle_anchor_gt_id'], 202)
+        self.assertFalse(result['identity_contamination'])
+
+    def test_oracle_never_changes_current_assignment(self):
+        reference_oracle = OnlineGTAnchorOracle(
+            self.tempdir.name, self.sequence, threshold=0.5)
+        oracle_logger = MemoryLogger()
+        oracle_tracker = Tracker(
+            args(carf_enabled=True, carf_policy='oracle_gt',
+                 carf_rollback_writes=[1]),
+            self.sequence, audit_logger=oracle_logger, oracle=self.oracle)
+        audit_tracker = Tracker(
+            args(carf_enabled=True, carf_policy='audit_only',
+                 carf_rollback_writes=[1]),
+            self.sequence, audit_logger=MemoryLogger(),
+            oracle=reference_oracle)
+        for frame_id, feature in ((1, (1.0, 0.0)),
+                                  (2, (1.0, 0.0)),
+                                  (3, (0.0, 1.0))):
+            rows = np.atleast_2d(detection(feature))
+            oracle_output = oracle_tracker.update(rows.copy(), rows.copy())
+            audit_output = audit_tracker.update(rows.copy(), rows.copy())
+            self.assertEqual([track.track_id for track in oracle_output],
+                             [track.track_id for track in audit_output])
+            for left, right in zip(oracle_output, audit_output):
+                np.testing.assert_array_equal(left.x1y1wh, right.x1y1wh)
+        self.assertTrue(any(record['authority_q'] == 0.0
+                            for record in oracle_logger.records))
+
+
+class TestV2Diagnostics(unittest.TestCase):
+    def test_metrics_delta_uses_equal_weight_sequence_macro(self):
+        baseline = {
+            'HOTA': 0.5, 'AssA': 0.4, 'IDF1': 0.3, 'IDSW': 10,
+            'per_sequence': {
+                'A': {'HOTA': .2, 'AssA': .2, 'IDF1': .2, 'IDSW': 8},
+                'B': {'HOTA': .8, 'AssA': .6, 'IDF1': .4, 'IDSW': 2},
+            },
+        }
+        candidate = {
+            'HOTA': 0.6, 'AssA': 0.5, 'IDF1': 0.4, 'IDSW': 8,
+            'per_sequence': {
+                'A': {'HOTA': .4, 'AssA': .4, 'IDF1': .4, 'IDSW': 4},
+                'B': {'HOTA': .8, 'AssA': .6, 'IDF1': .4, 'IDSW': 2},
+            },
+        }
+        delta = metrics_delta_vs_baseline(baseline, candidate)
+        self.assertAlmostEqual(
+            delta['macro_mean_per_sequence_delta']['delta_HOTA'], .1)
+        self.assertEqual(
+            delta['macro_mean_per_sequence_delta']['delta_IDSW'], -2.0)
+
+    def test_contamination_risk_lift_uses_auditable_labeled_denominator(self):
+        repo_root = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), '..', '..'))
+        path = os.path.join(repo_root, 'tools', 'analyze_carf_audit.py')
+        spec = importlib.util.spec_from_file_location('carf_analysis_v2', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        rows = [
+            {'auditable': True, 'identity_contamination': True,
+             'F_ij': 1.0, 'authority_q': 1.0},
+            {'auditable': True, 'identity_contamination': False,
+             'F_ij': 0.0, 'authority_q': 1.0},
+            {'auditable': False, 'identity_contamination': True,
+             'F_ij': None, 'authority_q': 1.0},
+        ]
+        summary = module.population_summary(rows)
+        self.assertEqual(
+            summary['contamination_rate_gt_labeled_and_auditable'], 0.5)
+        self.assertEqual(
+            summary['risk_lift_F_eq_1_vs_auditable_labeled'], 2.0)
+
+    def test_rollback_frame_age_after_suppressed_writes(self):
+        track = initiated_track()
+        track.update_features(np.asarray([[0.0, 1.0]]), 0.9,
+                              authority=1.0, frame_id=2)
+        track.update_features(np.asarray([[1.0, 0.0]]), 0.9,
+                              authority=1.0, frame_id=3)
+        track.update_features(np.asarray([[0.0, 1.0]]), 0.9,
+                              authority=0.0, frame_id=4)
+        track.update_features(np.asarray([[0.0, 1.0]]), 0.9,
+                              authority=0.0, frame_id=5)
+        snapshot = track.get_rollback_snapshot(1)
+        self.assertEqual(snapshot['frame_id'], 2)
+        self.assertEqual(5 - snapshot['frame_id'], 3)
+        self.assertEqual(track.num_feature_writes, 2)
 
 
 if __name__ == '__main__':

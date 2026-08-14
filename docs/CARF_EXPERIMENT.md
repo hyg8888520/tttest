@@ -1,110 +1,83 @@
-# CARF + SSU V1 experiment
+# CARF + SSU V1: first real experiment
 
-## Hypothesis and limits
+## Question and limits
 
-The falsifiable hypothesis is that a fragile accepted association can pollute a
-track's mutable appearance state and amplify later identity errors. CARF V1
-measures **counterfactual fragility**, not correctness and not an error
-probability. It does not change the current frame's assignment.
+This experiment asks whether a fragile accepted association can pollute a
+track's mutable appearance state and amplify later identity errors. CARF
+fragility measures sensitivity of TrackTrack's official association result to
+recent appearance state. It is not correctness, an error probability, or a
+calibrated continuous score. With rollback writes `[1, 3]`, fully auditable
+rows normally have `F` in `{0, 0.5, 1}`.
 
-V1 contains no learned component, alternate decoder, assignment entropy,
-no-appearance counterfactual, anchor, quarantine, re-anchor, TTL, router,
-Transformer, graph model, conformal layer, MoE, MHT, or new loss.
-
-## Algorithm
-
-For each official accepted edge `(track_i, detection_j)` and each configured
-write rollback `r`:
-
-1. Deep-clone all track and detection objects required by that association
-   stage.
-2. Replace only cloned `track_i.feat` with its rollback-by-write snapshot.
-3. Re-run TrackTrack's official `iterative_assignment` with unchanged inputs,
-   motion/Kalman state, thresholds, penalties, gating, and decoder.
-4. Record whether `(i,j)` survives.
-
-For valid rollbacks, `S_ij` is the survived fraction and `F_ij = 1-S_ij`. A row
-is `auditable=true` only when every requested rollback exists. Partial rollback
-outcomes may be logged for coverage analysis, but insufficient full history
-forces `q=1`.
-
-All counterfactuals for a stage run before any accepted write from that stage,
-so they observe exactly the state used for the official assignment. Runtime
-state fingerprints are checked around every audit; a mutation raises an error.
+CARF never changes the current-frame assignment. Counterfactuals deep-clone the
+official stage, replace only the target track feature, and rerun the same
+`iterative_assignment` function. Detection, ReID, motion/Kalman state, gating,
+track lifecycle, output IDs, boxes, and velocities remain baseline behavior.
 
 ## SSU policies
 
-The original innovation is:
+The original TrackTrack feature write is preserved verbatim when `q=1`. `q=0`
+leaves the appearance feature byte-for-byte unchanged. For `0<q<1`, SSU scales
+only the original appearance innovation.
+
+- `baseline`: CARF disabled; original update route.
+- `audit_only`: compute/log CARF; `q=1` exact baseline update.
+- `oracle_gt`: online GT-anchor Oracle controls only the accepted write.
+- `soft`: primary intervention, `q=S` (`soft_power=1`).
+- `hard`: aggressive ablation, `q=1` only when fully auditable `S=1`.
+
+Insufficient rollback history always gives `auditable=false` and `q=1`.
+
+## Online GT identity-anchor Oracle
+
+`oracle_gt` is explicitly:
 
 ```text
-beta_base = alpha + (1-alpha)*(1-score)
-innovation = 1-beta_base
+OFFLINE ORACLE - NOT A DEPLOYABLE METHOD: online GT identity anchor
 ```
 
-SSU applies only to `feat`:
+At each frame, detections are matched once to GT with deterministic one-to-one
+Hungarian matching on IoU at the fixed, untuned threshold `0.5`. This matching
+labels observations only and is unrelated to TrackTrack's association decoder.
+Both official TrackTrack association stages share this frame-global mapping.
 
-```text
-effective = q * innovation
-feat = normalize((1-effective)*old_feat + effective*new_feat)
-```
+After TrackTrack accepts an edge:
 
-- `baseline`: no CARF rerun; `q=1` through the original code path.
-- `audit_only`: compute/log CARF; `q=1` through the original code path.
-- `oracle_gt`: block only known GT-inconsistent writes; unknown means `q=1`.
-- `hard`: `q=1` iff fully auditable `S=1`, else `q=0`.
-- `soft`: `q=S**soft_power` when fully auditable.
+1. The first valid GT identity for `(track_id, birth_frame)` becomes its
+   immutable oracle anchor.
+2. A later known observation with the same identity gets `q=1`.
+3. A later known observation with another identity is labeled
+   `identity_contamination=true` and gets `q=0` under `oracle_gt`.
+4. Unknown/unmatched observations get `q=1`, never create/change an anchor,
+   and are excluded from contamination statistics.
 
-`q=0` leaves the feature byte-for-byte unchanged. `q=1` executes the original
-baseline arithmetic verbatim. Kalman mean/covariance, box, velocity, score,
-lifecycle, end frame, assignment, and current output ID never depend on `q`.
+The Oracle cannot reject detections, select another edge, or change the current
+assignment. The first valid observation can itself be wrong, so
+`identity_contamination` means disagreement with the track instance's initial
+known identity. It is not complete causal harmful-write ground truth. Same-ID
+low-quality or occluded writes can still be harmful.
 
-## Offline GT oracle
+The old `tools/prepare_carf_oracle.py` modal-trajectory artifact remains only as
+deprecated offline diagnostic code. Runtime `oracle_gt` does not read it and
+does not require `BEE24_ORACLE_ARTIFACT`.
 
-`oracle_gt` is always labeled:
+## BEE24 V2 splits
 
-```text
-OFFLINE ORACLE - NOT A DEPLOYABLE METHOD
-```
+Use `configs/carf/manifests/bee24_carf_v2.yaml`. Sequence IDs exactly match TOPIC
+cache keys, for example `BEE2406`, not `BEE24-06`.
 
-First run the baseline over the complete analysis sequence. Oracle preparation
-uses TrackEval CLEAR-compatible frame matching and assigns each predicted track
-the modal GT identity across its valid matches. During the oracle run, the
-current matched detection is matched to frame GT with the same IoU primitive,
-Hungarian primitive, and `0.5` threshold. A known mismatch gets `q=0`; a match
-gets `q=1`; unknown observation or canonical identity gets baseline `q=1`.
-The current accepted assignment is never replaced.
+- Gate 0: `BEE2406`, `BEE2414`.
+- `development_core`: 06, 10, 14, 15, 26, 29.
+- `development_long`: 35 (5000-frame moderate-density horizon).
+- `stress_dense_long`: 33, frozen for later stress evaluation.
+- Official test: 12, 13, 16, 18, 20, frozen and never used for tuning.
 
-## Fixed BEE24 split
+The old hash-based v1 manifest is retained but marked deprecated.
+`development_core` is not described as a 20% validation split.
 
-`configs/carf/manifests/bee24_carf_v1.yaml` partitions complete sequences, never
-frames. It records all 25 project-train, 6 development, and 5 official-test
-sequence names. Development was selected deterministically by SHA256 from the
-31 official train sequences. The adapter fails if a named sequence is absent.
+## Environment
 
-Do not tune rollback writes, `soft_power`, any threshold, or policy on
-`official_test`. Freeze choices using `project_train` and `development` first.
-The runner refuses enabled official-test evaluation unless
-`experiment.frozen=true` is explicit.
-
-## Gates
-
-1. **Gate 0 — baseline equivalence.** If baseline and audit-only differ at any
-   `(frame, track_id, bbox)`, fix the bug and stop all experiments.
-2. **Gate 1 — oracle upper bound.** Continue only if oracle write protection
-   improves AssA or IDF1, reduces IDSW, and does not degrade HOTA. Otherwise:
-   `appearance-state pollution is not a useful intervention target`.
-3. **Gate 2 — fragility signal.** Continue only if wrong writes show visible
-   fragility enrichment/separation (the gate script checks wrong median > clean
-   median, AUROC > 0.5, and `P(wrong|F>0) > P(wrong|F=0)`). Do not train a
-   predictor when this fails.
-4. **Gate 3 — real intervention.** Only after Gates 1 and 2 compare hard and
-   soft and report delta HOTA, AssA, IDF1, and IDSW against baseline.
-
-Speed is reported but is not a V1 gate.
-
-## Environment and YAML
-
-Install the small runtime additions, then set paths. Nothing is downloaded:
+Nothing is downloaded. TOPIC detector/ReID caches must already exist.
 
 ```bash
 python -m pip install -r requirements-carf.txt
@@ -112,65 +85,137 @@ export BEE24_ROOT=/path/to/BEE24
 export BEE24_DETECTIONS=/path/to/TOPICTrack/cache/det_bee24.pkl
 export BEE24_REID_FEATURES=/path/to/TOPICTrack/cache/embeddings
 export BEE24_DET_CKPT=/path/to/topictrack_bee_detector.pth.tar
-export BEE24_REID_CKPT=/path/to/bee24_AGW.pth
-export BEE24_CMC_ROOT=/optional/path/to/cmc
-export BEE24_ORACLE_ARTIFACT=/path/to/output/baseline/oracle_artifact.json
-export OUTPUT_ROOT=/path/to/output/carf_v1
+export BEE24_REID_CKPT=/path/to/BEE24_AGW.pth
+export BEE24_CMC_ROOT=/optional/unused/cmc/path
+export OUTPUT_ROOT=/path/to/output/carf_v2
 ```
 
-The two checkpoint paths are provenance fields when cached detection/features
-are used; they are not loaded by the adapter. `BEE24_CMC_ROOT` is likewise not
-read while `tracker.cmc.identity=true`.
+Checkpoint paths are provenance fields when cached observations are used.
+Identity CMC is frozen for BEE24 and does not read `BEE24_CMC_ROOT`.
 
-## Runs
+## Phase 0: data sanity
 
-Run from the repository root. Baseline and audit-only must use the same frozen
-YAML and cache files.
+This validates sequence/frame keys, detection and embedding row alignment,
+finite/positive boxes, image-scale bounds, feature dimensions, and high/low
+detection counts. It never regenerates a TOPIC cache.
 
 ```bash
-# pristine framework baseline (no CARF reruns)
-python "3. Tracker/run.py" --config configs/carf/bee24_tracktrack_audit.yaml carf.enabled=false carf.policy=baseline
-
-# prepare baseline modal identities from development GT
-python tools/prepare_carf_oracle.py --gt-root "$BEE24_ROOT/train" --tracker-results "$OUTPUT_ROOT/baseline/data" --manifest configs/carf/manifests/bee24_carf_v1.yaml --split development --output "$BEE24_ORACLE_ARTIFACT"
-
-# audit only (CARF logs plus oracle labels, exact baseline appearance writes)
-python "3. Tracker/run.py" --config configs/carf/bee24_tracktrack_audit.yaml carf.enabled=true carf.policy=audit_only
-
-# exact output Gate 0
-python tools/compare_tracking_outputs.py --baseline "$OUTPUT_ROOT/baseline/data" --candidate "$OUTPUT_ROOT/audit_only/data" --output "$OUTPUT_ROOT/equivalence.json"
-
-# GT oracle
-python "3. Tracker/run.py" --config configs/carf/bee24_tracktrack_audit.yaml carf.enabled=true carf.policy=oracle_gt
-
-# hard SSU (only after Gates 1 and 2)
-python "3. Tracker/run.py" --config configs/carf/bee24_tracktrack_audit.yaml carf.enabled=true carf.policy=hard
-
-# soft SSU (only after Gates 1 and 2)
-python "3. Tracker/run.py" --config configs/carf/bee24_tracktrack_audit.yaml carf.enabled=true carf.policy=soft
+python "3. Tracker/run.py" --sanity-only \
+  --config configs/carf/bee24_tracktrack_audit.yaml \
+  dataset.split=development_core
 ```
 
-Analyze audit rows and performance:
+Expected output: `$OUTPUT_ROOT/data_sanity.json`. Any mismatch fails loudly.
+
+## Phase 1: real-data Gate 0
+
+Use a dedicated output root and only the two Gate 0 sequences.
 
 ```bash
-python tools/analyze_carf_audit.py "$OUTPUT_ROOT/audit_only/carf_audit.jsonl" --output "$OUTPUT_ROOT/audit_only/carf_analysis.json" --sequence-csv "$OUTPUT_ROOT/audit_only/per_sequence.csv"
-python tools/compare_carf_performance.py --baseline "$OUTPUT_ROOT/baseline/performance.json" --audit "$OUTPUT_ROOT/audit_only/performance.json" --output "$OUTPUT_ROOT/performance_comparison.json"
-python tools/check_carf_gates.py --equivalence "$OUTPUT_ROOT/equivalence.json" --baseline-metrics "$OUTPUT_ROOT/baseline/metrics.json" --oracle-metrics "$OUTPUT_ROOT/oracle_gt/metrics.json" --audit-analysis "$OUTPUT_ROOT/audit_only/carf_analysis.json" --output "$OUTPUT_ROOT/gates.json"
+export OUTPUT_ROOT=/path/to/output/carf_v2_gate0
+
+python "3. Tracker/run.py" \
+  --config configs/carf/bee24_tracktrack_audit.yaml \
+  dataset.split=gate0 carf.enabled=false carf.policy=baseline
+
+python "3. Tracker/run.py" \
+  --config configs/carf/bee24_tracktrack_audit.yaml \
+  dataset.split=gate0 carf.enabled=true carf.policy=audit_only
+
+python tools/compare_tracking_outputs.py \
+  --baseline "$OUTPUT_ROOT/baseline/data" \
+  --candidate "$OUTPUT_ROOT/audit_only/data" \
+  --output "$OUTPUT_ROOT/equivalence.json"
 ```
 
-## Expected artifacts
+Every `(frame, track_id, bbox)` must be exactly equal. Stop on any difference.
 
-Each policy directory contains `data/<sequence>.txt`, `performance.json`, and,
-when GT evaluation is enabled, `metrics.json`. CARF-enabled non-baseline modes
-also contain `carf_audit.jsonl` with schema `carf.audit.v1`. Analysis produces
-`carf_analysis.json` and a per-sequence CSV. Full embeddings are never logged.
+## Phase 2: online GT Oracle
 
-The code establishes a falsifiable experiment. It does not assert that CARF is
-effective; only the remote data runs can determine the gates.
+Run baseline and Oracle on core plus the long-horizon sequence. No baseline
+identity artifact preparation is needed.
 
-After all choices are frozen, change `dataset.gt_root` to the official-test GT
-root used by the local TOPIC TrackEval layout and run with
-`dataset.split=official_test experiment.frozen=true`. Repeat the five policy
-commands without changing tracker/CARF parameters. If official-test GT is not
-available on the execution server, set `evaluation.enabled=false` and evaluate
-the emitted MOT files through the official service instead.
+```bash
+export OUTPUT_ROOT=/path/to/output/carf_v2_oracle
+
+python "3. Tracker/run.py" \
+  --config configs/carf/bee24_tracktrack_audit.yaml \
+  dataset.split=oracle_development carf.enabled=false carf.policy=baseline
+
+python "3. Tracker/run.py" \
+  --config configs/carf/bee24_tracktrack_audit.yaml \
+  dataset.split=oracle_development carf.enabled=true carf.policy=oracle_gt
+```
+
+Inspect combined and per-sequence `metrics.json`,
+`metrics_delta_vs_baseline.json`, and `write_diagnostics.json`. Interpret event
+count and metrics jointly:
+
+- Very rare contamination means cross-ID appearance contamination is not a
+  major observed baseline failure mode.
+- Common contamination without useful Oracle benefit means this selective
+  write intervention is ineffective.
+- Improved AssA/IDF1 and/or lower IDSW without meaningful HOTA degradation
+  supports proceeding.
+
+Tiny metric changes alone are not sufficient to conclude that SSU is useless.
+
+## Phase 3: audit-only signal analysis
+
+```bash
+export OUTPUT_ROOT=/path/to/output/carf_v2_core
+
+python "3. Tracker/run.py" \
+  --config configs/carf/bee24_tracktrack_audit.yaml \
+  dataset.split=development_core carf.enabled=false carf.policy=baseline
+
+python "3. Tracker/run.py" \
+  --config configs/carf/bee24_tracktrack_audit.yaml \
+  dataset.split=development_core carf.enabled=true carf.policy=audit_only
+
+python tools/analyze_carf_audit.py \
+  "$OUTPUT_ROOT/audit_only/carf_audit.jsonl" \
+  --output "$OUTPUT_ROOT/audit_only/carf_analysis.json" \
+  --sequence-csv "$OUTPUT_ROOT/audit_only/per_sequence.csv"
+```
+
+The primary table is `F | N | contamination_count | contamination_rate` for
+`F=0, 0.5, 1`. Risk lift for `F=1` uses only the GT-labeled, fully auditable
+population as its denominator. AUROC is secondary. This is mechanism evidence,
+not a complete success/failure definition for CARF.
+
+## Phase 4: CARF-guided SSU
+
+Only after Phase 2/3 provide useful evidence, run exactly:
+
+```bash
+# Primary intervention: q=S
+python "3. Tracker/run.py" \
+  --config configs/carf/bee24_tracktrack_audit.yaml \
+  dataset.split=development_core carf.enabled=true \
+  carf.policy=soft carf.soft_power=1.0
+
+# Aggressive ablation
+python "3. Tracker/run.py" \
+  --config configs/carf/bee24_tracktrack_audit.yaml \
+  dataset.split=development_core carf.enabled=true carf.policy=hard
+```
+
+Do not grid-search yet. Report combined TrackEval HOTA, DetA, AssA, IDF1,
+IDSW, MOTA, Frag, per-sequence deltas, and the equal-weight macro mean of
+per-sequence scalar deltas. If useful, repeat on `development_long`; only later
+consider `stress_dense_long` and finally the frozen official test.
+
+## Diagnostics and artifacts
+
+CARF JSONL schema `carf.audit.v2` records `S`, `F`, auditable status,
+`identity_contamination`, instance key, authority, consecutive zero-authority
+writes, frames since the last effective appearance update, and actual frame age
+of rollback-1/rollback-3. Rollback depth remains measured in committed
+appearance writes, never frames.
+
+Each run produces policy-specific MOT files, FPS, TrackEval combined and
+per-sequence metrics, write diagnostics, and when baseline metrics are present,
+per-sequence/macro deltas. No full embedding is logged. No result in this
+framework asserts that CARF is effective; the real-data phases are intended to
+falsify or support the hypothesis.

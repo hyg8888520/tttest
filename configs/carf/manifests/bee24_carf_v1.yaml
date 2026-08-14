@@ -1,4 +1,6 @@
 schema_version: carf.split.v1
+deprecated: true
+deprecation_note: Replaced by bee24_carf_v2.yaml for the first real experiment.
 dataset: BEE24
 source:
   videos: 36

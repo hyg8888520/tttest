@@ -110,10 +110,11 @@ The vendored evaluator is `3. Tracker/trackeval`. The legacy entry point is
 around these same classes. Formal results are reported as HOTA, DetA, AssA,
 IDF1, IDSW, MOTA, and Frag; no metric is reimplemented.
 
-The offline oracle preparation mirrors the frame matching code in
-`trackeval/metrics/clear.py` to export match/event labels and modal canonical GT
-IDs. Those labels are analysis metadata, not a second IDSW metric. Formal IDSW
-still comes only from TrackEval.
+The deprecated offline modal-GT diagnostic mirrors frame matching from
+`trackeval/metrics/clear.py`. The runtime online-anchor Oracle instead performs
+one frame-global detection-to-GT match solely to label already accepted edges.
+These labels are analysis metadata, not a second IDSW metric. Formal IDSW still
+comes only from TrackEval.
 
 ## BEE24/TOPIC interface audit
 
