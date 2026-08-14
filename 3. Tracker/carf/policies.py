@@ -2,6 +2,14 @@
 
 
 VALID_POLICIES = {'baseline', 'audit_only', 'hard', 'soft', 'oracle_gt'}
+COUNTERFACTUAL_AUDIT_POLICIES = {'audit_only', 'hard', 'soft'}
+
+
+def counterfactual_auditing_active(policy, enabled=True):
+    """Whether this policy actually requires CARF counterfactual reruns."""
+    if policy not in VALID_POLICIES:
+        raise ValueError('unknown CARF policy: %s' % policy)
+    return bool(enabled and policy in COUNTERFACTUAL_AUDIT_POLICIES)
 
 
 def authority_for_policy(policy, audit_result=None, soft_power=1.0,

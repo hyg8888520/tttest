@@ -10,6 +10,7 @@ from carf.evaluation import evaluate_results, metrics_delta_vs_baseline
 from carf.inputs import load_inputs, sanity_check_inputs
 from carf.logging import AuditJSONLWriter
 from carf.oracle import OnlineGTAnchorOracle
+from carf.policies import counterfactual_auditing_active
 
 
 def make_parser():
@@ -149,7 +150,9 @@ def run_configured(config_path, overrides):
     os.makedirs(result_folder, exist_ok=True)
     log_path = os.path.join(run_root, 'carf_audit.jsonl')
     logger = None
-    if args.carf_enabled and args.carf_policy != 'baseline':
+    auditing_active = counterfactual_auditing_active(
+        args.carf_policy, args.carf_enabled)
+    if auditing_active:
         logger = AuditJSONLWriter(
             log_path, config.get('carf', {}).get('log_schema', 'carf.audit.v2'))
 
@@ -198,8 +201,7 @@ def run_configured(config_path, overrides):
         'tracker_seconds': total_time,
         'fps': fps,
         'carf_enabled': bool(args.carf_enabled),
-        'auditing_active': bool(args.carf_enabled and
-                                args.carf_policy != 'baseline'),
+        'auditing_active': auditing_active,
     }
     with open(os.path.join(run_root, 'performance.json'), 'w', encoding='utf-8') as handle:
         json.dump(performance, handle, indent=2, sort_keys=True)

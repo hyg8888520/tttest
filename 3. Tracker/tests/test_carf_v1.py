@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock, patch
 from types import SimpleNamespace
 import importlib.util
 import os
@@ -13,7 +14,8 @@ if TRACKER_ROOT not in sys.path:
     sys.path.insert(0, TRACKER_ROOT)
 
 from carf.auditor import CARFAuditor
-from carf.policies import authority_for_policy
+from carf.policies import (authority_for_policy,
+                           counterfactual_auditing_active)
 from carf.inputs import load_topic_cache, sanity_check_inputs
 from carf.evaluation import metrics_delta_vs_baseline
 from carf.oracle import OnlineGTAnchorOracle, match_detections_to_gt
@@ -204,7 +206,23 @@ class TestEquivalence(unittest.TestCase):
         tracker = Tracker(args(carf_enabled=True, carf_policy='baseline'),
                           'synthetic')
         self.assertFalse(tracker.carf_enabled)
+        self.assertFalse(tracker.auditing_active)
         self.assertIsNone(tracker.carf_auditor)
+
+    def test_auditing_policies_execute_carf_auditor(self):
+        for policy in ('audit_only', 'hard', 'soft'):
+            with self.subTest(policy=policy):
+                tracker = Tracker(
+                    args(carf_enabled=True, carf_policy=policy,
+                         carf_rollback_writes=[1]), 'synthetic')
+                self.assertTrue(tracker.auditing_active)
+                original = tracker.carf_auditor.audit_match
+                tracker.carf_auditor.audit_match = Mock(wraps=original)
+                rows = np.atleast_2d(detection((1.0, 0.0)))
+                tracker.update(rows.copy(), rows.copy())
+                tracker.update(rows.copy(), rows.copy())
+                self.assertGreater(
+                    tracker.carf_auditor.audit_match.call_count, 0)
 
 
 class TestBEE24Adapter(unittest.TestCase):
@@ -366,6 +384,9 @@ class TestOnlineGTAnchorOracle(unittest.TestCase):
             args(carf_enabled=True, carf_policy='oracle_gt',
                  carf_rollback_writes=[1]),
             self.sequence, audit_logger=oracle_logger, oracle=self.oracle)
+        self.assertTrue(oracle_tracker.carf_enabled)
+        self.assertFalse(oracle_tracker.auditing_active)
+        self.assertIsNone(oracle_tracker.carf_auditor)
         audit_tracker = Tracker(
             args(carf_enabled=True, carf_policy='audit_only',
                  carf_rollback_writes=[1]),
@@ -381,8 +402,46 @@ class TestOnlineGTAnchorOracle(unittest.TestCase):
                              [track.track_id for track in audit_output])
             for left, right in zip(oracle_output, audit_output):
                 np.testing.assert_array_equal(left.x1y1wh, right.x1y1wh)
-        self.assertTrue(any(record['authority_q'] == 0.0
-                            for record in oracle_logger.records))
+        diagnostics = oracle_tracker.write_diagnostics_summary()
+        self.assertGreater(diagnostics['oracle_blocked_writes'], 0)
+        self.assertEqual(oracle_logger.records, [])
+
+    def test_oracle_gt_never_constructs_counterfactual_auditor(self):
+        with patch('trackers.tracker.CARFAuditor',
+                   side_effect=AssertionError('CARFAuditor must not run')):
+            tracker = Tracker(
+                args(carf_enabled=True, carf_policy='oracle_gt'),
+                self.sequence, oracle=self.oracle)
+            rows = np.atleast_2d(detection((1.0, 0.0)))
+            tracker.update(rows.copy(), rows.copy())
+            tracker.update(rows.copy(), rows.copy())
+        self.assertFalse(counterfactual_auditing_active('oracle_gt', True))
+
+    def test_oracle_unknown_gt_falls_back_to_baseline_write(self):
+        class UnknownOracle:
+            def __init__(self):
+                self.prepared_frames = []
+
+            def prepare_frame(self, frame_id, detections):
+                self.prepared_frames.append(frame_id)
+
+            def judge(self, frame_id, track, detection):
+                return {'identity_contamination': None}
+
+        oracle = UnknownOracle()
+        tracker = Tracker(
+            args(carf_enabled=True, carf_policy='oracle_gt'),
+            'synthetic', oracle=oracle)
+        first = np.atleast_2d(detection((1.0, 0.0)))
+        second = np.atleast_2d(detection((0.9, 0.1)))
+        tracker.update(first.copy(), first.copy())
+        self.assertEqual(oracle.prepared_frames, [])
+        tracker.update(second.copy(), second.copy())
+        self.assertEqual(oracle.prepared_frames, [2])
+        diagnostics = tracker.write_diagnostics_summary()
+        self.assertEqual(diagnostics['accepted_write_opportunities'], 1)
+        self.assertEqual(diagnostics['mean_authority_q'], 1.0)
+        self.assertEqual(tracker.tracks[0].num_feature_writes, 1)
 
 
 class TestV2Diagnostics(unittest.TestCase):

@@ -2,7 +2,7 @@ from trackers.cmc import *
 from trackers.utils import *
 from trackers.track import *
 from carf.auditor import CARFAuditor
-from carf.policies import authority_for_policy
+from carf.policies import authority_for_policy, counterfactual_auditing_active
 
 
 def _feature_cosine(before, after):
@@ -47,9 +47,13 @@ class Tracker(object):
         self.carf_policy = getattr(args, 'carf_policy', 'baseline')
         self.carf_enabled = (bool(getattr(args, 'carf_enabled', False)) and
                              self.carf_policy != 'baseline')
+        self.auditing_active = counterfactual_auditing_active(
+            self.carf_policy, self.carf_enabled)
         self.carf_soft_power = float(getattr(args, 'carf_soft_power', 1.0))
-        self.audit_logger = audit_logger
+        self.audit_logger = audit_logger if self.auditing_active else None
         self.oracle = oracle
+        self._oracle_frame_detections = []
+        self._oracle_prepared_frame = None
         self._write_stats = {
             'accepted_write_opportunities': 0,
             'gt_labeled_writes': 0,
@@ -60,7 +64,7 @@ class Tracker(object):
         }
         self._track_write_diagnostics = {}
         self.carf_auditor = None
-        if self.carf_enabled:
+        if self.auditing_active:
             self.carf_auditor = CARFAuditor(
                 getattr(args, 'carf_rollback_writes', [1, 3]))
 
@@ -85,32 +89,44 @@ class Tracker(object):
                 stage_tracks[t].update(self.frame_id, flat_detections[d])
             return
 
+        if (self.oracle is not None and len(matches) > 0 and
+                self._oracle_prepared_frame != self.frame_id):
+            # The official association has already produced an accepted edge.
+            # Prepare one frame-global GT mapping only now; it cannot affect
+            # either official decoder call or the accepted assignment.
+            self.oracle.prepare_frame(
+                self.frame_id, self._oracle_frame_detections)
+            self._oracle_prepared_frame = self.frame_id
+
         pending = []
         for t, d in matches:
             track = stage_tracks[t]
             detection = flat_detections[d]
-            rollback_snapshots = {
-                writes: track.get_rollback_snapshot(writes)
-                for writes in self.carf_auditor.rollback_writes
-            }
-            rollback_states = {
-                writes: (None if snapshot is None else snapshot['feature'])
-                for writes, snapshot in rollback_snapshots.items()
-            }
-            rollback_frame_ages = {
-                writes: (None if snapshot is None or
-                         snapshot['frame_id'] is None else
-                         int(self.frame_id - snapshot['frame_id']))
-                for writes, snapshot in rollback_snapshots.items()
-            }
-            audit = self.carf_auditor.audit_match(
-                baseline_tracker_state=stage_tracks,
-                frame_detections=detection_groups,
-                accepted_match=(t, d),
-                association_stage=stage_name,
-                rollback_states=rollback_states,
-                association_kwargs=self._association_kwargs(),
-            )
+            audit = None
+            rollback_frame_ages = {}
+            if self.auditing_active:
+                rollback_snapshots = {
+                    writes: track.get_rollback_snapshot(writes)
+                    for writes in self.carf_auditor.rollback_writes
+                }
+                rollback_states = {
+                    writes: (None if snapshot is None else snapshot['feature'])
+                    for writes, snapshot in rollback_snapshots.items()
+                }
+                rollback_frame_ages = {
+                    writes: (None if snapshot is None or
+                             snapshot['frame_id'] is None else
+                             int(self.frame_id - snapshot['frame_id']))
+                    for writes, snapshot in rollback_snapshots.items()
+                }
+                audit = self.carf_auditor.audit_match(
+                    baseline_tracker_state=stage_tracks,
+                    frame_detections=detection_groups,
+                    accepted_match=(t, d),
+                    association_stage=stage_name,
+                    rollback_states=rollback_states,
+                    association_kwargs=self._association_kwargs(),
+                )
 
             oracle_fields = {
                 'gt_id': None,
@@ -251,10 +267,9 @@ class Tracker(object):
             detection.frame_detection_index = detection_index
         for detection_index, detection in enumerate(dets_del, start=len(dets)):
             detection.frame_detection_index = detection_index
-        if self.oracle is not None:
-            # One frame-global one-to-one GT mapping is shared by both official
-            # association stages. It labels accepted observations only.
-            self.oracle.prepare_frame(self.frame_id, dets + dets_del)
+        # Keep the complete observation set for lazy Oracle preparation after
+        # the official decoder has produced at least one accepted edge.
+        self._oracle_frame_detections = dets + dets_del
 
         # Divide detections
         dets_high = [d for d in dets if d.score > self.args.det_thr]
